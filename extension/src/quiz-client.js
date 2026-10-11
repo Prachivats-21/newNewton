@@ -13,8 +13,8 @@
 // Supabase Configuration (AWS Mumbai - ap-south-1)
 // Replace with your Supabase project credentials from Project Settings -> API
 export const SUPABASE_CONFIG = {
-  url: 'https://YOUR_PROJECT_ID.supabase.co',
-  anonKey: 'YOUR_SUPABASE_ANON_KEY'
+  url: 'https://wwxqskccvcpimcgctskm.supabase.co',
+  anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind3eHFza2NjdmNwaW1jZ2N0c2ttIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE3MjM2MjgsImV4cCI6MjEwNzI5OTYyOH0.uEXGkzcIXbqyU5lRnFVyAF0c04YI0SoED6p98EYrbcc'
 };
 
 const CHOICE_LETTERS = ['A', 'B', 'C', 'D', 'E'];
