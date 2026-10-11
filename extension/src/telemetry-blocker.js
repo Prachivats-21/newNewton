@@ -51,7 +51,7 @@
         tokenStr = parsed;
       }
     } else if (typeof parsed === 'object' && parsed !== null) {
-      tokenStr = parsed.token || parsed.access_token || null;
+      tokenStr = parsed.token || parsed.access_token || parsed.authToken || parsed.auth_token || null;
     }
 
     if (typeof tokenStr === 'string') {
@@ -59,6 +59,56 @@
     }
     return null;
   }
+
+  // Hook localStorage.setItem to immediately detect auth-token when student logs in
+  try {
+    const originalSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      originalSetItem.apply(this, arguments);
+      if (typeof key === 'string') {
+        const lowerKey = key.toLowerCase();
+        if (
+          lowerKey === 'auth-token' ||
+          lowerKey === 'token' ||
+          lowerKey === 'access_token' ||
+          lowerKey === 'authtoken' ||
+          lowerKey === 'auth_token' ||
+          lowerKey === 'access_token_ns_student_web'
+        ) {
+          const clean = extractCleanAuthToken(value);
+          if (clean) {
+            try {
+              window.postMessage({
+                source: 'newton-enhancer-token-captured',
+                rawToken: clean
+              }, '*');
+            } catch (e) {}
+          }
+        }
+      }
+    };
+  } catch (e) {}
+
+  // Hook HTML5 History API to notify content script of SPA route transitions (Next.js Link navigation)
+  try {
+    const originalPushState = history.pushState;
+    history.pushState = function (...args) {
+      const res = originalPushState.apply(this, args);
+      try {
+        window.dispatchEvent(new Event('newton-enhancer-location-change'));
+      } catch (e) {}
+      return res;
+    };
+
+    const originalReplaceState = history.replaceState;
+    history.replaceState = function (...args) {
+      const res = originalReplaceState.apply(this, args);
+      try {
+        window.dispatchEvent(new Event('newton-enhancer-location-change'));
+      } catch (e) {}
+      return res;
+    };
+  } catch (e) {}
 
   function syncDocAttribute() {
     if (document.documentElement) {
@@ -206,11 +256,54 @@
     };
   }
 
-  // 8. Intercept window.fetch for diagnostic reports and tracking requests
+  // Helper to inspect request headers and capture bearer tokens on login or API calls
+  function inspectAndBroadcastAuthHeader(headers) {
+    if (!headers) return null;
+    try {
+      let authHeader = null;
+      if (typeof headers.get === 'function') {
+        authHeader = headers.get('authorization') || headers.get('Authorization');
+      } else if (typeof headers === 'object') {
+        authHeader = headers.authorization || headers.Authorization;
+      }
+      if (typeof authHeader === 'string') {
+        const clean = extractCleanAuthToken(authHeader);
+        if (clean) {
+          window.postMessage({
+            source: 'newton-enhancer-token-captured',
+            rawToken: clean
+          }, '*');
+          return clean;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function getStoredPortalToken() {
+    try {
+      return (
+        localStorage.getItem('auth-token') ||
+        localStorage.getItem('token') ||
+        localStorage.getItem('access_token') ||
+        localStorage.getItem('authToken') ||
+        localStorage.getItem('auth_token') ||
+        sessionStorage.getItem('auth-token') ||
+        sessionStorage.getItem('token') ||
+        sessionStorage.getItem('access_token')
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 8. Intercept window.fetch for diagnostic reports, telemetry, and quiz events
   if (typeof window.fetch === 'function') {
     const originalFetch = window.fetch.bind(window);
     window.fetch = async function (input, init) {
       const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+      const method = (init && init.method ? init.method : (input && input.method ? input.method : 'GET')).toUpperCase();
+
       if (isBlockingEnabled && isTelemetryUrl(url)) {
         return new Response(JSON.stringify({ blocked: true, status: 'ok', source: 'newton-enhancer' }), {
           status: 200,
@@ -218,13 +311,36 @@
           headers: { 'Content-Type': 'application/json' }
         });
       }
-      // Intercept quiz submission endpoints: POST /api/v1/course/h/{courseHash}/assessment/h/{assessmentHash}/questions/?auto_submit=...
-      const quizSubmitMatch = url.match(/\/api\/v1\/course\/h\/([^/]+)\/assessment\/h\/([^/]+)\/questions\//i);
-      if (quizSubmitMatch && init && init.method && init.method.toUpperCase() === 'POST') {
+
+      // Check for auth header to capture token
+      let capturedToken = null;
+      if (init && init.headers) {
+        capturedToken = inspectAndBroadcastAuthHeader(init.headers);
+      } else if (input && input.headers) {
+        capturedToken = inspectAndBroadcastAuthHeader(input.headers);
+      }
+
+      // 1. Intercept quiz opened: GET .../assessment/h/{assessmentHash}/questions/ or .../instructions/
+      const quizOpenMatch = url.match(/\/api\/v[12]\/course\/(?:h\/)?([^/]+)\/assessment\/(?:h\/)?([^/]+)\/(?:questions|instructions)(?:\/|$|\?)/i);
+      if (quizOpenMatch && method === 'GET') {
+        const courseHash = quizOpenMatch[1];
+        const assessmentHash = quizOpenMatch[2];
+        try {
+          window.postMessage({
+            source: 'newton-enhancer-quiz-opened',
+            courseHash,
+            assessmentHash
+          }, '*');
+        } catch (e) {}
+      }
+
+      // 2. Intercept quiz submission: POST /api/v1/course/h/{courseHash}/assessment/h/{assessmentHash}/questions/?auto_submit=...
+      const quizSubmitMatch = url.match(/\/api\/v[12]\/course\/(?:h\/)?([^/]+)\/assessment\/(?:h\/)?([^/]+)\/questions(?:\/|$|\?)/i);
+      if (quizSubmitMatch && method === 'POST') {
         const courseHash = quizSubmitMatch[1];
         const assessmentHash = quizSubmitMatch[2];
         try {
-          const rawToken = localStorage.getItem('auth-token');
+          const rawToken = capturedToken || getStoredPortalToken();
           const authToken = extractCleanAuthToken(rawToken);
           window.postMessage({
             source: 'newton-enhancer-quiz-submitted',
@@ -242,11 +358,30 @@
   // 9. Intercept XMLHttpRequest
   if (typeof XMLHttpRequest !== 'undefined') {
     const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
     const originalSend = XMLHttpRequest.prototype.send;
 
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this._telemetryUrl = url;
+      this._httpMethod = (method || 'GET').toUpperCase();
+      this._authHeader = null;
       return originalOpen.apply(this, [method, url, ...rest]);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (header, value) {
+      if (typeof header === 'string' && header.toLowerCase() === 'authorization') {
+        this._authHeader = value;
+        const clean = extractCleanAuthToken(value);
+        if (clean) {
+          try {
+            window.postMessage({
+              source: 'newton-enhancer-token-captured',
+              rawToken: clean
+            }, '*');
+          } catch (e) {}
+        }
+      }
+      return originalSetRequestHeader.apply(this, arguments);
     };
 
     XMLHttpRequest.prototype.send = function (body) {
@@ -273,6 +408,38 @@
         }, 0);
         return;
       }
+
+      // Check quiz open in XHR
+      if (this._httpMethod === 'GET' && typeof this._telemetryUrl === 'string') {
+        const quizOpenMatch = this._telemetryUrl.match(/\/api\/v[12]\/course\/(?:h\/)?([^/]+)\/assessment\/(?:h\/)?([^/]+)\/(?:questions|instructions)(?:\/|$|\?)/i);
+        if (quizOpenMatch) {
+          try {
+            window.postMessage({
+              source: 'newton-enhancer-quiz-opened',
+              courseHash: quizOpenMatch[1],
+              assessmentHash: quizOpenMatch[2]
+            }, '*');
+          } catch (e) {}
+        }
+      }
+
+      // Check quiz submit in XHR
+      if (this._httpMethod === 'POST' && typeof this._telemetryUrl === 'string') {
+        const quizSubmitMatch = this._telemetryUrl.match(/\/api\/v[12]\/course\/(?:h\/)?([^/]+)\/assessment\/(?:h\/)?([^/]+)\/questions(?:\/|$|\?)/i);
+        if (quizSubmitMatch) {
+          try {
+            const rawToken = this._authHeader || getStoredPortalToken();
+            const authToken = extractCleanAuthToken(rawToken);
+            window.postMessage({
+              source: 'newton-enhancer-quiz-submitted',
+              courseHash: quizSubmitMatch[1],
+              assessmentHash: quizSubmitMatch[2],
+              authToken
+            }, '*');
+          } catch (e) {}
+        }
+      }
+
       return originalSend.apply(this, arguments);
     };
   }

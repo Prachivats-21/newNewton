@@ -45,7 +45,7 @@
         tokenStr = parsed;
       }
     } else if (typeof parsed === 'object' && parsed !== null) {
-      tokenStr = parsed.token || parsed.access_token || null;
+      tokenStr = parsed.token || parsed.access_token || parsed.authToken || parsed.auth_token || null;
     }
 
     if (typeof tokenStr === 'string') {
@@ -167,7 +167,8 @@
           const raw = getRawPortalToken();
           token = extractCleanAuthToken(raw);
         } catch (e) {}
-        const courseHash = window.location.pathname.match(/\/course\/([^/]+)/)?.[1] || null;
+        const courseMatch = window.location.pathname.match(/\/course\/(?:h\/)?([^/?#]+)/i);
+        const courseHash = (courseMatch && courseMatch[1] !== 'h') ? courseMatch[1] : null;
         sendResponse({ token, courseHash });
       }
       return true;
@@ -182,8 +183,12 @@
         localStorage.getItem('token'),
         localStorage.getItem('access_token'),
         localStorage.getItem('authToken'),
+        localStorage.getItem('auth_token'),
+        localStorage.getItem('access_token_ns_student_web'),
         sessionStorage.getItem('auth-token'),
-        sessionStorage.getItem('token')
+        sessionStorage.getItem('token'),
+        sessionStorage.getItem('access_token'),
+        sessionStorage.getItem('authToken')
       ];
       for (const c of candidates) {
         if (c) return c;
@@ -195,16 +200,20 @@
   }
 
   // Sync portal auth token & UID for background attendance and quiz sync
-  function syncPortalAuth() {
+  function syncPortalAuth(explicitToken = null) {
     try {
-      const rawToken = getRawPortalToken();
+      const rawToken = explicitToken || getRawPortalToken();
       if (rawToken) {
-        let courseHash = window.location.pathname.match(/\/course\/([^/]+)/)?.[1] || null;
+        const cMatch = window.location.pathname.match(/\/course\/(?:h\/)?([^/?#]+)/i);
+        let courseHash = (cMatch && cMatch[1] !== 'h') ? cMatch[1] : null;
         if (!courseHash) {
           try {
             const storedCourse = localStorage.getItem('current_course') || localStorage.getItem('active_course') || localStorage.getItem('active_course_hash');
             if (storedCourse) {
-              courseHash = storedCourse.startsWith('{') ? JSON.parse(storedCourse).hash : storedCourse;
+              const parsed = storedCourse.startsWith('{') ? JSON.parse(storedCourse).hash : storedCourse;
+              if (parsed && parsed !== 'h') {
+                courseHash = parsed;
+              }
             }
           } catch (e) {}
         }
@@ -240,6 +249,7 @@
       }
     } catch (e) {}
   }
+
   syncPortalAuth();
   document.addEventListener('DOMContentLoaded', syncPortalAuth);
   window.addEventListener('load', syncPortalAuth);
@@ -263,18 +273,130 @@
     }
   });
 
-  // 6. Listen for quiz submission events intercepted from MAIN world
+  if (document.body) {
+    observer.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: false });
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      if (document.body) {
+        observer.observe(document.body, { attributes: true, attributeFilter: ['class'], subtree: false });
+      }
+    });
+  }
+
+  // Cache of assessments confirmed to already have verified solutions in database
+  const knownQuizzesWithAnswers = new Set();
+  let lastCheckedAssessmentHash = null;
+
+  function handleQuizOpened(courseHash, assessmentHash) {
+    if (!assessmentHash || assessmentHash === 'h') return;
+    if (assessmentHash === lastCheckedAssessmentHash) return;
+    lastCheckedAssessmentHash = assessmentHash;
+
+    const effectiveCourse = (courseHash && courseHash !== 'h') ? courseHash : null;
+    console.log(`[Newton Enhancer] Quiz opened: ${assessmentHash} (Course: ${effectiveCourse || 'auto'}). Checking if solutions exist in Supabase...`);
+
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+      chrome.runtime.sendMessage({
+        action: 'CHECK_QUIZ_SOLUTIONS',
+        assessmentHash,
+        courseHash: effectiveCourse
+      }, (response) => {
+        if (response && response.result) {
+          const res = response.result;
+          if (res.exists && res.hasAnswers) {
+            knownQuizzesWithAnswers.add(assessmentHash);
+          }
+          console.log(`[Newton Enhancer] Solutions status for ${assessmentHash}:`, res.exists ? (res.hasAnswers ? 'Available in Supabase' : 'Archived (unrevealed)') : 'Not yet in Supabase');
+          window.postMessage({
+            source: 'newton-enhancer-quiz-solutions-status',
+            assessmentHash,
+            exists: res.exists,
+            hasAnswers: res.hasAnswers || false,
+            data: res.data || null
+          }, '*');
+        }
+      });
+    }
+  }
+
+  function checkCurrentPageForQuiz() {
+    try {
+      const match = window.location.pathname.match(/\/course\/(?:h\/)?([^/?#]+)\/(?:assessment|assignment|quiz)\/(?:h\/)?([^/?#]+)/i);
+      if (match && match[1] !== 'h' && match[2] !== 'h') {
+        handleQuizOpened(match[1], match[2]);
+      }
+    } catch (e) {}
+  }
+
+  // Check on initial run, DOMContentLoaded, window load, and history events
+  checkCurrentPageForQuiz();
+  window.addEventListener('DOMContentLoaded', checkCurrentPageForQuiz);
+  window.addEventListener('load', checkCurrentPageForQuiz);
+  window.addEventListener('popstate', checkCurrentPageForQuiz);
+  window.addEventListener('hashchange', checkCurrentPageForQuiz);
+  window.addEventListener('newton-enhancer-location-change', checkCurrentPageForQuiz);
+
+  // Monitor SPA route changes via document observer
+  let lastUrl = window.location.href;
+  const urlObserver = new MutationObserver(() => {
+    if (window.location.href !== lastUrl) {
+      lastUrl = window.location.href;
+      checkCurrentPageForQuiz();
+    }
+  });
+  if (document.documentElement) {
+    urlObserver.observe(document.documentElement, { subtree: true, childList: true });
+  }
+
+  // Cross-tab and in-tab storage change listeners
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'auth-token' || e.key === 'token' || e.key === 'access_token' || e.key === 'authToken') {
+      syncPortalAuth();
+    }
+  });
+
+  // 6. Listen for events intercepted from MAIN world (world: "MAIN")
   window.addEventListener('message', (event) => {
-    if (event.data && event.data.source === 'newton-enhancer-quiz-submitted') {
+    if (!event.data) return;
+
+    // A. Token captured on login or API invocation
+    if (event.data.source === 'newton-enhancer-token-captured') {
+      syncPortalAuth(event.data.rawToken);
+    }
+
+    // B. Quiz opened (intercepted via GET /questions/ or /instructions/)
+    if (event.data.source === 'newton-enhancer-quiz-opened') {
+      const { courseHash, assessmentHash } = event.data;
+      handleQuizOpened(courseHash, assessmentHash);
+    }
+
+    // C. Quiz submitted (intercepted via POST /questions/)
+    if (event.data.source === 'newton-enhancer-quiz-submitted') {
       const { courseHash, assessmentHash, authToken } = event.data;
-      if (courseHash && assessmentHash) {
-        console.log(`[Newton Enhancer] Quiz submitted: ${assessmentHash} (Course: ${courseHash}). Requesting archival check...`);
-        chrome.runtime.sendMessage({
-          action: 'ARCHIVE_QUIZ',
-          courseHash,
-          assessmentHash,
-          authToken
-        });
+      if (assessmentHash && assessmentHash !== 'h') {
+        // If answers are already verified in database, skip redundant upload
+        if (knownQuizzesWithAnswers.has(assessmentHash)) {
+          console.log(`[Newton Enhancer] Quiz ${assessmentHash} already has verified answers in database. Skipping duplicate archival.`);
+          return;
+        }
+
+        const effectiveCourse = (courseHash && courseHash !== 'h') ? courseHash : null;
+        const effectiveToken = authToken || extractCleanAuthToken(getRawPortalToken());
+
+        console.log(`[Newton Enhancer] Quiz submitted: ${assessmentHash} (Course: ${effectiveCourse || 'auto'}). Requesting archival to database...`);
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+          chrome.runtime.sendMessage({
+            action: 'ARCHIVE_QUIZ',
+            courseHash: effectiveCourse,
+            assessmentHash,
+            authToken: effectiveToken
+          }, (response) => {
+            console.log(`[Newton Enhancer] Archival result for ${assessmentHash}:`, response?.result || response?.error);
+            if (response?.result?.status === 'SUCCESS' || response?.result?.status === 'CACHE_HIT' || response?.result?.status === 'LOCKED_BY_RLS') {
+              knownQuizzesWithAnswers.add(assessmentHash);
+            }
+          });
+        }
       }
     }
   });

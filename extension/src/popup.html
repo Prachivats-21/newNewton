@@ -23,7 +23,7 @@
             <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>
           </svg>
         </a>
-        <span class="badge">v1.1</span>
+        <span class="badge">v1.2</span>
       </div>
     </header>
     <!-- Top 4-Part Navbar -->
@@ -275,41 +275,24 @@
         </div>
       </div>
 
-      <!-- 4. Mystery Tab Pane: Quiz Archiver -->
+      <!-- 4. Mystery Tab Pane (Placeholder) -->
       <div class="tab-pane" id="tabMystery" role="tabpanel" aria-labelledby="navBtnMystery">
-        <div class="card placeholder-card mystery-card" style="padding: 16px 14px;">
+        <div class="card placeholder-card mystery-card">
           <div class="placeholder-icon-wrapper mystery-glow">
             <svg class="placeholder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
               <path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/>
               <path d="M5 3v4M3 5h4M19 17v4M17 19h4"/>
             </svg>
           </div>
-          <span class="placeholder-badge mystery-badge">Live System</span>
-          <h3 class="placeholder-title" style="margin-top: 6px;">Quiz Solutions Archiver</h3>
-          <p class="placeholder-desc" style="margin-bottom: 12px;">
-            Archives past quiz solutions into Supabase directly from your browser session to unlock questions & answer keys.
+          <span class="placeholder-badge mystery-badge">Classified</span>
+          <h3 class="placeholder-title">Mystery Module</h3>
+          <p class="placeholder-desc">
+            A secret module is under active construction. Stay tuned for updates!
           </p>
 
-          <!-- 1. Auth Token & LMS Diagnostics -->
-          <div style="width: 100%; background: var(--segment-bg, rgba(0,0,0,0.04)); border: 1px solid var(--border-color, rgba(0,0,0,0.08)); border-radius: 8px; padding: 10px; margin-bottom: 12px; text-align: left; font-size: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-              <span style="font-weight: 600;">🔑 LMS Connection:</span>
-              <span id="tokenStatusBadge" class="badge" style="font-size: 10px; padding: 2px 6px;">Checking...</span>
-            </div>
-            <div id="tokenDiagnosticDetails" style="font-size: 11px; opacity: 0.85; margin-bottom: 8px; line-height: 1.4;">
-              Detecting session credentials...
-            </div>
-            <button type="button" id="btnTestLmsAuth" class="btn btn-secondary" style="width: 100%; padding: 5px 10px; font-size: 11px; cursor: pointer; border-radius: 5px;">
-              🧪 Test LMS Auth Token
-            </button>
-          </div>
-
-          <!-- 2. Sync Controller -->
-          <div id="quizSyncStatusBox" class="mystery-box" style="width: 100%; display: flex; flex-direction: column; gap: 8px; align-items: center; text-align: center;">
-            <div id="quizSyncStatusText" style="font-size: 12px; opacity: 0.9; line-height: 1.4;">Checking sync status...</div>
-            <button type="button" id="btnManualQuizSync" class="btn btn-primary" style="width: 100%; padding: 7px 14px; font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 6px;">
-              🔄 Sync Past Quizzes Now
-            </button>
+          <div class="mystery-box">
+            <span class="mystery-lock-icon">🔒</span>
+            <span class="mystery-text">Secret feature arriving soon</span>
           </div>
         </div>
       </div>

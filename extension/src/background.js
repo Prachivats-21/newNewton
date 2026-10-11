@@ -94,43 +94,75 @@ async function syncTelemetryBlockingRules(shouldBlock) {
 }
 
 // Helper: Attempt initial historical sync if auth token is present and not yet synced
+let isSyncInProgress = false;
+
 async function checkAndTriggerInitialSync(force = false) {
-  const syncState = await chrome.storage.local.get(['quiz_history_synced_at', 'nst_auth_token', 'nst_portal_uid', 'nst_portal_course_hash']);
-  if (!force && syncState.quiz_history_synced_at) {
-    return { status: 'ALREADY_SYNCED', syncedAt: syncState.quiz_history_synced_at };
+  if (isSyncInProgress) {
+    console.log('[Newton Enhancer] Initial quiz sync is already in progress, skipping duplicate call.');
+    return { status: 'IN_PROGRESS' };
   }
 
-  let token = syncState.nst_auth_token;
-
-  // If no token in storage, check cookies if available
-  if (!token && typeof chrome !== 'undefined' && chrome.cookies) {
-    try {
-      const cookie = await chrome.cookies.get({
-        url: 'https://my.newtonschool.co',
-        name: 'access_token_ns_student_web'
-      });
-      if (cookie && cookie.value) {
-        token = extractCleanAuthToken(cookie.value);
-        if (token) {
-          await chrome.storage.local.set({ nst_auth_token: token });
-        }
-      }
-    } catch (e) {}
-  }
-
-  if (!token) {
-    console.log('[Newton Enhancer] Initial sync pending: waiting for student authentication token...');
-    return { status: 'PENDING_AUTH' };
-  }
-
+  isSyncInProgress = true;
   try {
-    const res = await syncHistoricalQuizzes(token, syncState.nst_portal_uid, syncState.nst_portal_course_hash);
+    const syncState = await chrome.storage.local.get(['quiz_history_synced_at', 'nst_auth_token', 'nst_portal_uid', 'nst_portal_course_hash']);
+    if (!force && syncState.quiz_history_synced_at) {
+      return { status: 'ALREADY_SYNCED', syncedAt: syncState.quiz_history_synced_at };
+    }
+
+    let token = syncState.nst_auth_token;
+
+    // If no token in storage, check cookies if available
+    if (!token && typeof chrome !== 'undefined' && chrome.cookies) {
+      try {
+        let cookie = await chrome.cookies.get({
+          url: 'https://my.newtonschool.co',
+          name: 'access_token_ns_student_web'
+        });
+        if (!cookie) {
+          const allCookies = await chrome.cookies.getAll({ domain: 'newtonschool.co' });
+          cookie = allCookies.find(c => c.name === 'access_token_ns_student_web' || c.name.toLowerCase().includes('token'));
+        }
+        if (cookie && cookie.value) {
+          token = extractCleanAuthToken(cookie.value);
+          if (token) {
+            await chrome.storage.local.set({ nst_auth_token: token });
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!token) {
+      console.log('[Newton Enhancer] Initial sync pending: waiting for student authentication token...');
+      return { status: 'PENDING_AUTH' };
+    }
+
+    const effectiveCourse = (syncState.nst_portal_course_hash && syncState.nst_portal_course_hash !== 'h')
+      ? syncState.nst_portal_course_hash
+      : null;
+
+    const res = await syncHistoricalQuizzes(token, syncState.nst_portal_uid, effectiveCourse);
     console.log('[Newton Enhancer] Initial quiz archival sync complete:', res);
     return res;
   } catch (err) {
     console.error('[Newton Enhancer] Initial quiz sync failed:', err);
     return { status: 'FAILED', error: err.message };
+  } finally {
+    isSyncInProgress = false;
   }
+}
+
+// Listen to LMS session cookie updates on login
+if (typeof chrome !== 'undefined' && chrome.cookies && chrome.cookies.onChanged) {
+  chrome.cookies.onChanged.addListener((changeInfo) => {
+    if (!changeInfo.removed && changeInfo.cookie && (changeInfo.cookie.name === 'access_token_ns_student_web' || changeInfo.cookie.name.toLowerCase().includes('token'))) {
+      const clean = extractCleanAuthToken(changeInfo.cookie.value);
+      if (clean) {
+        chrome.storage.local.set({ nst_auth_token: clean }, () => {
+          checkAndTriggerInitialSync();
+        });
+      }
+    }
+  });
 }
 
 // 1. Extension install / update: set initial defaults & flag first install
