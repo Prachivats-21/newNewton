@@ -22,23 +22,13 @@ create index if not exists idx_quizzes_has_answers on public.quizzes (has_answer
 -- 3. Enable Row Level Security (RLS)
 alter table public.quizzes enable row level security;
 
--- Policy 1: Anyone with the anon public key can read archived quizzes
+-- Policy 1: Allow public read access (clients can check and read solutions)
 create policy "Allow public read access"
   on public.quizzes
   for select
   using (true);
 
--- Policy 2: Anyone with the anon public key can insert new quizzes
-create policy "Allow public insert"
-  on public.quizzes
-  for insert
-  with check (true);
-
--- Policy 3: Immutable Answer Lock
--- Quizzes can only be updated if their answers were NOT previously revealed.
--- Once has_answers_revealed is true, answers cannot be corrupted or overwritten!
-create policy "Allow updating unrevealed quizzes only"
-  on public.quizzes
-  for update
-  using (has_answers_revealed = false)
-  with check (true);
+-- 4. Revoke ALL write permissions from client roles (anon and authenticated)
+-- No client is allowed to write to the database!
+-- Only the Supabase Edge Function (running with service_role) can insert/update.
+revoke insert, update, delete on table public.quizzes from anon, authenticated;

@@ -1,48 +1,34 @@
 # Supabase Setup Guide (ap-south-1 Mumbai)
 
-Newton Enhancer uses **Supabase** hosted directly in **AWS Mumbai (`ap-south-1`)** for ultra-low latency (<5ms) and native PostgreSQL JSONB storage with immutable Row Level Security (RLS).
+Newton Enhancer uses **Supabase Edge Functions** and **PostgreSQL** hosted directly in **AWS Mumbai (`ap-south-1`)** for ultra-low latency (<5ms) and 100% tamper-proof server-side quiz ingestion.
 
 ---
 
-## 1. Create Supabase Project
+## 1. Security Architecture (Clean Room Server Ingestion)
 
-1. Go to [supabase.com](https://supabase.com) and click **"New Project"**.
-2. **Project Name**: `newton-enhancer` (or any name you prefer).
-3. **Region**: Select **India (Mumbai) - `ap-south-1`** (This ensures it is colocated with Newton LMS for 0ms ping).
-4. Set a database password and click **Create new project**.
-
----
-
-## 2. Apply Database Schema & Security Rules
-
-1. Open your project dashboard in Supabase.
-2. Navigate to **SQL Editor** in the left sidebar.
-3. Click **"New query"**.
-4. Paste the entire content of [`schema.sql`](./schema.sql) and click **Run**.
-5. You should see `Success. No rows returned`.
+1. **Client is Strictly Read-Only**:
+   - The Chrome extension has **ZERO write access** to the database (`INSERT`, `UPDATE`, `DELETE` are revoked for client roles).
+   - The Chrome extension **NEVER fetches answers** from Newton LMS.
+2. **Server-Side Fetching**:
+   - On login or quiz submission, the extension only sends the student's `authToken` and assessment hashes to the **Supabase Edge Function** (`sync-quizzes`).
+   - The Edge Function (running in AWS Mumbai, unblocked by Newton's WAF) fetches questions and authentic solutions directly from Newton LMS.
+   - The Edge Function writes directly to PostgreSQL using server-side service role privileges.
+3. **Database Immutability**:
+   - Once a quiz with answers is archived, it cannot be tampered with or modified by any client.
 
 ---
 
-## 3. Link Extension to Supabase
+## 2. Supabase Configuration
 
-1. In your Supabase dashboard, go to **Project Settings** (gear icon) -> **API**.
-2. Copy:
-   - **Project URL** (e.g. `https://xyzcompany.supabase.co`)
-   - **Project API keys** -> `anon` / `public` key (e.g. `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...`)
-3. Open `extension/src/quiz-client.js` and update `SUPABASE_CONFIG`:
-   ```javascript
-   export const SUPABASE_CONFIG = {
-     url: 'https://YOUR_PROJECT_ID.supabase.co',
-     anonKey: 'YOUR_SUPABASE_ANON_KEY'
-   };
-   ```
+The project is configured with:
+- **Project URL**: `https://wwxqskccvcpimcgctskm.supabase.co`
+- **Region**: **India (Mumbai) - `ap-south-1`**
+- **Edge Function**: `https://wwxqskccvcpimcgctskm.supabase.co/functions/v1/sync-quizzes`
+- **Database Table**: `public.quizzes` (Read-only for public/anon)
 
 ---
 
-## 4. Why This Architecture is Tamper-Proof
+## 3. Edge Function Deployment
 
-- **Direct PostgREST REST API**: The extension communicates directly with Supabase via HTTPS REST, requiring zero heavy dependencies.
-- **Row Level Security (RLS)**:
-  - Read access is public for all quizzes.
-  - Insert is allowed for new quizzes.
-  - Update is **strictly restricted** to quizzes where `has_answers_revealed = false`. Once answers are revealed, PostgreSQL rejects any modifications at the database engine level, preventing anyone from tampering with verified answers.
+The Edge Function code is located in [`functions/sync-quizzes/index.ts`](./functions/sync-quizzes/index.ts).
+It is automatically deployed to Supabase via the Antigravity Supabase MCP server.
