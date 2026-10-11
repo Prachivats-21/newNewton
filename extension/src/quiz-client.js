@@ -1,21 +1,20 @@
 /**
  * Newton Enhancer - Quiz Solution Client & Interceptor
+ * Powered by Supabase (AWS Mumbai ap-south-1)
  *
  * Handles:
- * 1. Client-side LMS queries (avoids Cloud Function 403 IP block from Newton WAF)
- * 2. Question normalization
- * 3. Firestore caching checks (free reads via REST API)
- * 4. Ingestion of extracted quizzes to Cloud Functions / Firestore
+ * 1. Direct browser LMS extraction (bypasses any server WAF IP restrictions)
+ * 2. Question normalization and option parsing
+ * 3. Fast caching checks via Supabase PostgREST API (<5ms ping to Mumbai)
+ * 4. Ingestion of extracted quizzes to Supabase PostgreSQL with RLS protection
  * 5. LMS auth-token validation and live diagnostics
  */
 
-// Firebase Project Configuration
-export const FIREBASE_CONFIG = {
-  projectId: 'newnewton',
-  region: 'asia-south2',
-  useEmulator: false, // Set to true during local testing
-  emulatorHost: 'http://127.0.0.1:5001',
-  emulatorFirestoreHost: 'http://127.0.0.1:8080'
+// Supabase Configuration (AWS Mumbai - ap-south-1)
+// Replace with your Supabase project credentials from Project Settings -> API
+export const SUPABASE_CONFIG = {
+  url: 'https://YOUR_PROJECT_ID.supabase.co',
+  anonKey: 'YOUR_SUPABASE_ANON_KEY'
 };
 
 const CHOICE_LETTERS = ['A', 'B', 'C', 'D', 'E'];
@@ -60,56 +59,6 @@ export function extractCleanAuthToken(raw) {
     return tokenStr.replace(/^Bearer\s+/i, '').trim();
   }
   return null;
-}
-
-/**
- * Resolves the Cloud Function endpoint URL
- */
-function getCloudFunctionUrl(functionName = 'archiveQuizSolution') {
-  if (FIREBASE_CONFIG.useEmulator) {
-    return `${FIREBASE_CONFIG.emulatorHost}/${FIREBASE_CONFIG.projectId}/${FIREBASE_CONFIG.region}/${functionName}`;
-  }
-  return `https://${FIREBASE_CONFIG.region}-${FIREBASE_CONFIG.projectId}.cloudfunctions.net/${functionName}`;
-}
-
-/**
- * Resolves the Firestore REST API document URL for a quiz
- */
-function getFirestoreQuizDocUrl(assessmentHash) {
-  if (FIREBASE_CONFIG.useEmulator) {
-    return `${FIREBASE_CONFIG.emulatorFirestoreHost}/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/quizzes/${assessmentHash}`;
-  }
-  return `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/quizzes/${assessmentHash}`;
-}
-
-/**
- * Parses Firestore REST API field types into a clean JS object
- */
-function decodeFirestoreValue(valueObj) {
-  if (!valueObj || typeof valueObj !== 'object') return valueObj;
-
-  if ('stringValue' in valueObj) return valueObj.stringValue;
-  if ('integerValue' in valueObj) return parseInt(valueObj.integerValue, 10);
-  if ('doubleValue' in valueObj) return parseFloat(valueObj.doubleValue);
-  if ('booleanValue' in valueObj) return valueObj.booleanValue;
-  if ('nullValue' in valueObj) return null;
-  if ('timestampValue' in valueObj) return valueObj.timestampValue;
-
-  if ('arrayValue' in valueObj) {
-    const list = valueObj.arrayValue.values || [];
-    return list.map(decodeFirestoreValue);
-  }
-
-  if ('mapValue' in valueObj) {
-    const fields = valueObj.mapValue.fields || {};
-    const result = {};
-    for (const [k, v] of Object.entries(fields)) {
-      result[k] = decodeFirestoreValue(v);
-    }
-    return result;
-  }
-
-  return valueObj;
 }
 
 /**
@@ -159,47 +108,62 @@ export function normalizeNewtonQuestions(rawQuestions) {
 }
 
 /**
- * Step 1: Check if solutions already exist in Firestore via Firestore REST API
- * (1 single free read, 0 serverless compute cost)
+ * Step 1: Check if solutions already exist in Supabase via PostgREST API
  *
  * @param {string} assessmentHash
  * @returns {Promise<{exists: boolean, data?: object}>}
  */
-export async function checkSolutionsInFirestore(assessmentHash) {
-  if (!assessmentHash) return { exists: false };
+export async function checkSolutionsInSupabase(assessmentHash) {
+  if (!assessmentHash || !SUPABASE_CONFIG.url || SUPABASE_CONFIG.url.includes('YOUR_PROJECT_ID')) {
+    return { exists: false };
+  }
 
   try {
-    const url = getFirestoreQuizDocUrl(assessmentHash);
-    const resp = await fetch(url, { method: 'GET' });
-
-    if (resp.status === 404) {
-      return { exists: false };
-    }
+    const url = `${SUPABASE_CONFIG.url}/rest/v1/quizzes?assessment_hash=eq.${encodeURIComponent(assessmentHash)}&select=*`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'apikey': SUPABASE_CONFIG.anonKey,
+        'Authorization': `Bearer ${SUPABASE_CONFIG.anonKey}`,
+        'Accept': 'application/json'
+      }
+    });
 
     if (!resp.ok) {
-      console.warn(`[QuizClient] Firestore REST returned HTTP ${resp.status}`);
+      console.warn(`[QuizClient] Supabase REST returned HTTP ${resp.status}`);
       return { exists: false };
     }
 
-    const json = await resp.json();
-    if (json && json.fields) {
-      const decoded = {};
-      for (const [key, val] of Object.entries(json.fields)) {
-        decoded[key] = decodeFirestoreValue(val);
-      }
-
-      const hasQuestions = Array.isArray(decoded.questions) && decoded.questions.length > 0;
+    const list = await resp.json();
+    if (Array.isArray(list) && list.length > 0) {
+      const doc = list[0];
+      const hasQuestions = Array.isArray(doc.questions) && doc.questions.length > 0;
       if (hasQuestions) {
-        return { exists: true, data: decoded };
+        return {
+          exists: true,
+          data: {
+            assessmentHash: doc.assessment_hash,
+            courseHash: doc.course_hash,
+            title: doc.title,
+            totalQuestions: doc.total_questions,
+            hasAnswersRevealed: doc.has_answers_revealed,
+            questions: doc.questions,
+            createdAt: doc.created_at,
+            updatedAt: doc.updated_at
+          }
+        };
       }
     }
 
     return { exists: false };
   } catch (err) {
-    console.warn(`[QuizClient] Could not check Firestore:`, err);
+    console.warn('[QuizClient] Could not check Supabase cache:', err);
     return { exists: false };
   }
 }
+
+// Backward compatibility alias
+export const checkSolutionsInFirestore = checkSolutionsInSupabase;
 
 /**
  * Live test of Newton LMS auth token from the browser
@@ -332,118 +296,106 @@ export async function fetchAssessmentQuestionsFromLMS(token, courseHash, assessm
   return Array.isArray(data) ? data : (data.questions || []);
 }
 
-const EXTENSION_SIGNING_SECRET = 'nst_enhancer_v1_8e4f1a9b2c3d5e7f';
-
 /**
- * Generates cryptographic HMAC-SHA256 signature headers using browser WebCrypto
+ * Saves a single quiz directly to Supabase via PostgREST
  */
-async function createSignatureHeaders(bodyString) {
-  const timestamp = Date.now().toString();
-  const nonce = (typeof crypto !== 'undefined' && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : (Math.random().toString(36).slice(2) + Date.now().toString(36));
-  const message = `${timestamp}:${nonce}:${bodyString}`;
-
-  try {
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(EXTENSION_SIGNING_SECRET),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    const sigBuffer = await crypto.subtle.sign('HMAC', key, encoder.encode(message));
-    const sigHex = Array.from(new Uint8Array(sigBuffer))
-      .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
-
-    return {
-      'X-NST-Timestamp': timestamp,
-      'X-NST-Nonce': nonce,
-      'X-NST-Signature': sigHex
-    };
-  } catch (e) {
-    console.warn('[QuizClient] WebCrypto signature generation error:', e);
-    return {};
+export async function saveQuizSolutionToSupabase(courseHash, assessmentHash, quizPayload, uid = null) {
+  if (!SUPABASE_CONFIG.url || SUPABASE_CONFIG.url.includes('YOUR_PROJECT_ID')) {
+    console.warn('[QuizClient] Supabase credentials not set, skipping remote save.');
+    return { status: 'CONFIG_PENDING', assessmentHash };
   }
-}
 
-/**
- * Saves a single quiz directly to Cloud Functions
- */
-export async function saveQuizSolutionToCloud(courseHash, assessmentHash, quizPayload, authToken = null) {
-  const endpoint = getCloudFunctionUrl('archiveQuizSolution');
-  const cleanToken = extractCleanAuthToken(authToken);
-
-  const bodyObj = {
-    courseHash,
-    assessmentHash,
+  const url = `${SUPABASE_CONFIG.url}/rest/v1/quizzes`;
+  const row = {
+    assessment_hash: assessmentHash,
+    course_hash: courseHash,
     title: quizPayload.title || null,
-    questions: quizPayload.questions,
-    hasAnswersRevealed: quizPayload.hasAnswersRevealed ?? true,
-    authToken: cleanToken || null
+    total_questions: Array.isArray(quizPayload.questions) ? quizPayload.questions.length : 0,
+    has_answers_revealed: quizPayload.hasAnswersRevealed ?? true,
+    questions: quizPayload.questions || [],
+    archived_by_uid: uid || null,
+    updated_at: new Date().toISOString()
   };
-  const bodyString = JSON.stringify(bodyObj);
-  const sigHeaders = await createSignatureHeaders(bodyString);
 
-  const res = await fetch(endpoint, {
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(cleanToken ? { 'Authorization': `Bearer ${cleanToken}` } : {}),
-      ...sigHeaders
+      'apikey': SUPABASE_CONFIG.anonKey,
+      'Authorization': `Bearer ${SUPABASE_CONFIG.anonKey}`,
+      'Prefer': 'resolution=merge-duplicates'
     },
-    body: bodyString
+    body: JSON.stringify(row)
   });
 
-  const result = await res.json();
   if (!res.ok) {
-    throw new Error(result.error || `Failed to save quiz: HTTP ${res.status}`);
+    const errorText = await res.text();
+    throw new Error(`Failed to save quiz to Supabase: HTTP ${res.status} - ${errorText}`);
   }
-  return result;
+
+  return { status: 'SUCCESS', assessmentHash };
 }
 
+// Backward compatibility alias
+export const saveQuizSolutionToCloud = saveQuizSolutionToSupabase;
+
 /**
- * Ingests a batch of extracted quizzes into Firestore via Cloud Function
+ * Ingests a batch of extracted quizzes into Supabase via PostgREST
  */
-export async function batchSaveQuizzesToCloud(quizzes, uid = null, authToken = null) {
+export async function batchSaveQuizzesToSupabase(quizzes, uid = null) {
   if (!Array.isArray(quizzes) || quizzes.length === 0) {
     return { status: 'SUCCESS', savedCount: 0 };
   }
 
-  const endpoint = getCloudFunctionUrl('batchSaveQuizzes');
-  const cleanToken = extractCleanAuthToken(authToken);
+  if (!SUPABASE_CONFIG.url || SUPABASE_CONFIG.url.includes('YOUR_PROJECT_ID')) {
+    console.warn('[QuizClient] Supabase credentials not set, skipping batch save.');
+    return { status: 'CONFIG_PENDING', savedCount: 0 };
+  }
 
-  const bodyObj = { quizzes, uid, authToken: cleanToken || null };
-  const bodyString = JSON.stringify(bodyObj);
-  const sigHeaders = await createSignatureHeaders(bodyString);
+  const url = `${SUPABASE_CONFIG.url}/rest/v1/quizzes`;
+  const now = new Date().toISOString();
 
-  const res = await fetch(endpoint, {
+  const rows = quizzes.map((q) => ({
+    assessment_hash: q.assessmentHash,
+    course_hash: q.courseHash,
+    title: q.title || null,
+    total_questions: q.totalQuestions || (Array.isArray(q.questions) ? q.questions.length : 0),
+    has_answers_revealed: q.hasAnswersRevealed ?? true,
+    questions: q.questions || [],
+    archived_by_uid: uid || null,
+    updated_at: now
+  }));
+
+  const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(cleanToken ? { 'Authorization': `Bearer ${cleanToken}` } : {}),
-      ...sigHeaders
+      'apikey': SUPABASE_CONFIG.anonKey,
+      'Authorization': `Bearer ${SUPABASE_CONFIG.anonKey}`,
+      'Prefer': 'resolution=merge-duplicates'
     },
-    body: bodyString
+    body: JSON.stringify(rows)
   });
 
-  const result = await res.json();
   if (!res.ok) {
-    throw new Error(result.error || `Batch save failed: HTTP ${res.status}`);
+    const errorText = await res.text();
+    throw new Error(`Batch save to Supabase failed: HTTP ${res.status} - ${errorText}`);
   }
-  return result;
+
+  return { status: 'SUCCESS', savedCount: rows.length };
 }
+
+// Backward compatibility alias
+export const batchSaveQuizzesToCloud = batchSaveQuizzesToSupabase;
 
 /**
  * Orchestrator: Full historical sync performed safely on client
  *
  * 1. Resolves active semester
  * 2. Fetches completed assessments list
- * 3. Checks Firestore for each assessment
+ * 3. Checks Supabase for each assessment
  * 4. Extracts questions from LMS for unarchived assessments
- * 5. Batch-saves all new quizzes to Firestore
+ * 5. Batch-saves all new quizzes to Supabase
  */
 export async function syncHistoricalQuizzes(token, uid = null, preferredCourseHash = null, onProgress = null) {
   const cleanToken = extractCleanAuthToken(token);
@@ -501,8 +453,8 @@ export async function syncHistoricalQuizzes(token, uid = null, preferredCourseHa
     }
 
     try {
-      // Check Firestore cache first
-      const existing = await checkSolutionsInFirestore(assessmentHash);
+      // Check Supabase cache first
+      const existing = await checkSolutionsInSupabase(assessmentHash);
       if (existing.exists) {
         summary.alreadyExisted += 1;
         continue;
@@ -531,17 +483,17 @@ export async function syncHistoricalQuizzes(token, uid = null, preferredCourseHa
     }
   }
 
-  // 4. Batch save unarchived quizzes to Firestore
+  // 4. Batch save unarchived quizzes to Supabase
   if (quizzesToSave.length > 0) {
     if (onProgress) {
       onProgress({
         stage: 'saving',
         count: quizzesToSave.length,
-        message: `Saving ${quizzesToSave.length} quiz(zes) to Cloud Firestore...`
+        message: `Saving ${quizzesToSave.length} quiz(zes) to Supabase...`
       });
     }
 
-    await batchSaveQuizzesToCloud(quizzesToSave, uid, cleanToken);
+    await batchSaveQuizzesToSupabase(quizzesToSave, uid);
     summary.newlyArchived = quizzesToSave.length;
   }
 
@@ -576,8 +528,8 @@ export async function handleQuizSubmissionArchival(courseHash, assessmentHash, a
   }
 
   try {
-    // 1. Check Firestore first
-    const existing = await checkSolutionsInFirestore(assessmentHash);
+    // 1. Check Supabase first
+    const existing = await checkSolutionsInSupabase(assessmentHash);
     if (existing.exists) {
       return { status: 'CACHE_HIT', data: existing.data };
     }
@@ -587,13 +539,14 @@ export async function handleQuizSubmissionArchival(courseHash, assessmentHash, a
     const normalized = normalizeNewtonQuestions(rawQuestions);
     const hasSolutions = normalized.some(q => q.correctChoice !== null || q.correctExplanation !== null);
 
-    // 3. Save to Cloud Functions / Firestore
-    const result = await saveQuizSolutionToCloud(courseHash, assessmentHash, {
+    // 3. Save to Supabase
+    const result = await saveQuizSolutionToSupabase(courseHash, assessmentHash, {
+      title: 'Quiz Assessment',
       questions: normalized,
       hasAnswersRevealed: hasSolutions
-    }, token);
+    });
 
-    console.log('[QuizClient] Quiz solutions archived successfully to Firestore:', result);
+    console.log('[QuizClient] Quiz solutions archived successfully to Supabase:', result);
     return result;
   } catch (err) {
     console.error('[QuizClient] Failed to handle quiz archival:', err);

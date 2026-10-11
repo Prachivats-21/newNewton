@@ -1454,22 +1454,22 @@ async function updateQuizSyncStatusUI() {
     const summaryText = sum ? `(${sum.newlyArchived || 0} archived, ${sum.alreadyExisted || 0} cached)` : '';
     quizSyncStatusText.innerHTML = `✅ <b>Synced</b> ${dateStr}<br><small>${summaryText}</small>`;
   } else {
-    quizSyncStatusText.innerHTML = '⚡ <b>Ready to sync</b><br><small>Click below to archive all submitted quizzes directly to Firestore.</small>';
+    quizSyncStatusText.innerHTML = '⚡ <b>Ready to sync</b><br><small>Click below to archive all submitted quizzes directly to Supabase.</small>';
   }
 }
 
 btnManualQuizSync?.addEventListener('click', async () => {
   if (!btnManualQuizSync || !quizSyncStatusText) return;
   btnManualQuizSync.disabled = true;
-  quizSyncStatusText.innerHTML = '⏳ <b>Syncing quizzes...</b><br><small>Extracting past assessments from LMS & archiving into Firestore...</small>';
+  quizSyncStatusText.innerHTML = '⏳ <b>Syncing quizzes...</b><br><small>Extracting past assessments from LMS & archiving into Supabase...</small>';
 
   try {
     chrome.runtime.sendMessage({ action: 'TRIGGER_INITIAL_SYNC', force: true }, (response) => {
       btnManualQuizSync.disabled = false;
       if (response && response.result && response.result.summary) {
         const s = response.result.summary;
-        quizSyncStatusText.innerHTML = `✅ <b>Sync Completed!</b><br><small>${s.newlyArchived} newly archived, ${s.alreadyExisted} already in Firestore.</small>`;
-        showStatus(`Archived ${s.newlyArchived} quizzes into Firestore!`);
+        quizSyncStatusText.innerHTML = `✅ <b>Sync Completed!</b><br><small>${s.newlyArchived} newly archived, ${s.alreadyExisted} already in Supabase.</small>`;
+        showStatus(`Archived ${s.newlyArchived} quizzes into Supabase!`);
       } else if (response && response.result && response.result.status === 'PENDING_AUTH') {
         quizSyncStatusText.innerHTML = '⚠️ <b>Authentication needed.</b><br><small>Open my.newtonschool.co first to acquire token.</small>';
         showStatus('Please log into Newton School portal first', false);

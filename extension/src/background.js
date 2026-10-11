@@ -6,7 +6,7 @@
 
 import {
   handleQuizSubmissionArchival,
-  checkSolutionsInFirestore,
+  checkSolutionsInSupabase,
   syncHistoricalQuizzes,
   extractCleanAuthToken
 } from './quiz-client.js';
@@ -189,7 +189,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message.action === 'CHECK_QUIZ_SOLUTIONS') {
     const { assessmentHash } = message;
-    checkSolutionsInFirestore(assessmentHash)
+    checkSolutionsInSupabase(assessmentHash)
       .then((res) => {
         sendResponse({ success: true, result: res });
       })

@@ -24,10 +24,14 @@ Newton School's frontend contains:
 /Users/swap/Developer/newton-enhancer/
 ├── README.md                      # Project README & user guide
 ├── menu.json                      # Reference campus mess menu
+├── supabase/                      # Supabase schema & setup guide (AWS Mumbai ap-south-1)
+│   ├── schema.sql                 # PostgreSQL tables & RLS policies
+│   └── README.md                  # Supabase quickstart guide
 └── extension/                     # Chrome Extension (Load Unpacked)
     ├── manifest.json              # Chrome MV3 configuration, permissions, & content scripts
     └── src/
         ├── background.js          # Background service worker: declarativeNetRequest dynamic rules
+        ├── quiz-client.js         # Supabase PostgREST client & quiz extraction engine
         ├── telemetry-blocker.js   # Main-world script: crash-proof stubs & beacon/fetch/XHR interceptors
         ├── content.js             # Isolated-world content script: theme enforcement & state synchronization
         ├── popup.html             # Multi-tab popup UI (Utilities, Mess Menu, Attendance, Mystery)

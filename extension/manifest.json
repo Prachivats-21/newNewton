@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "newNewton",
-  "version": "1.1.4",
-  "description": "UX Enhancer for Newton School - Native Grauity Theme Switcher and Telemetry Blocker",
+  "version": "1.2.0",
+  "description": "UX Enhancer for Newton School - Native Grauity Theme Switcher, Telemetry Blocker and Supabase Solution Archiver",
   "permissions": [
     "storage",
     "activeTab",
@@ -15,10 +15,8 @@
     "https://my.newtonschool.co/*",
     "https://*.newtonschool.co/*",
     "https://raw.githubusercontent.com/*",
-    "https://firestore.googleapis.com/*",
-    "https://*.cloudfunctions.net/*",
-    "http://127.0.0.1:5001/*",
-    "http://127.0.0.1:8080/*"
+    "https://*.supabase.co/*",
+    "http://127.0.0.1:54321/*"
   ],
   "background": {
     "service_worker": "src/background.js",
