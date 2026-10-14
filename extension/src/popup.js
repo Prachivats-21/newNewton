@@ -24,6 +24,15 @@
 
 import { fetchFullAttendanceData } from './attendance/portal-api.js';
 import { summarize, combine, DEFAULT_TARGET } from './attendance/math.js';
+import {
+  fetchUnsubmittedQuizzes,
+  submitQuizWithSupabaseSolutions,
+  extractShortCourseName,
+  sliderPosToSeconds,
+  secondsToSliderPos,
+  computeQuestionDelay
+} from './quiz-client.js';
+
 
 // ========================================================
 // 1. CONSTANTS & DEFINITIONS
@@ -193,6 +202,33 @@ const btnSyncAttendance = document.getElementById('btnSyncAttendance');
 const attTargetPills = document.querySelectorAll('.att-target-pill');
 const attendanceContainer = document.getElementById('attendanceContainer');
 
+// Mystery elements
+const mysteryHeroCount = document.getElementById('mysteryHeroCount');
+const mysteryBadge = document.getElementById('mysteryBadge');
+const mysterySyncStatus = document.getElementById('mysterySyncStatus');
+const btnRefreshMystery = document.getElementById('btnRefreshMystery');
+const btnSubmitAllMystery = document.getElementById('btnSubmitAllMystery');
+const mysteryContainer = document.getElementById('mysteryContainer');
+
+// Lazy Submit elements
+const toggleLazySubmit = document.getElementById('toggleLazySubmit');
+const lazyStatusPill = document.getElementById('lazyStatusPill');
+const lazySlidersContainer = document.getElementById('lazySlidersContainer');
+const delaySlider = document.getElementById('delaySlider');
+const delayValBadge = document.getElementById('delayValBadge');
+const entropySlider = document.getElementById('entropySlider');
+const entropyValBadge = document.getElementById('entropyValBadge');
+const lazyKeepBrowserOpenNote = document.getElementById('lazyKeepBrowserOpenNote');
+
+// Live Progress Banner elements
+const mysteryLiveBanner = document.getElementById('mysteryLiveBanner');
+const liveQuizTitle = document.getElementById('liveQuizTitle');
+const liveStatusText = document.getElementById('liveStatusText');
+const liveProgressBar = document.getElementById('liveProgressBar');
+const btnPauseResume = document.getElementById('btnPauseResume');
+const btnFastForward = document.getElementById('btnFastForward');
+const btnStopSubmission = document.getElementById('btnStopSubmission');
+
 // State variables
 let currentMenuData = null;
 let selectedDay = 'Monday';
@@ -200,6 +236,19 @@ let todayDayName = 'Monday';
 
 let currentAttendanceData = null;
 let currentAttendanceTarget = DEFAULT_TARGET; // 0.75
+
+let currentMysteryData = null;
+let isMysteryLoading = false;
+let isMysterySubmitting = false;
+
+// Lazy Submit configuration state
+let isLazySubmitEnabled = false;
+let currentLazyDelay = 15;
+let currentLazyEntropy = 5;
+let skipRemainingDelay = false;
+let isSubmissionStopped = false;
+let activeWaitResolver = null;
+
 
 // ========================================================
 // 4. SHARED UTILITY FUNCTIONS
@@ -292,6 +341,11 @@ function switchTab(targetTabId) {
   // If opening attendance and data not loaded yet, initiate load
   if (targetTabId === 'tabAttendance' && !currentAttendanceData) {
     initAttendance();
+  }
+
+  // If opening mystery and data not loaded yet, initiate load
+  if (targetTabId === 'tabMystery' && !currentMysteryData) {
+    initMystery();
   }
 }
 
@@ -1339,7 +1393,1225 @@ btnSyncAttendance?.addEventListener('click', () => {
   loadAttendanceData(true);
 });
 
-// Auto-initialize Mess Menu and Attendance on start
+// ========================================================
+// 10. MYSTERY TAB CONTROLLER (Unsubmitted Quizzes & Auto-Solver)
+// ========================================================
+
+function renderMysteryEmpty(customMessage = null, isExpired = false) {
+  if (!mysteryContainer) return;
+
+  const title = isExpired ? 'Portal Session Expired' : 'Portal Login Required';
+  const desc = customMessage || (isExpired
+    ? 'Your session on Newton School has expired. Please open the portal to log in and refresh your quizzes.'
+    : 'Connect to your Newton School portal to automatically discover unsubmitted quizzes and solutions.');
+
+  mysteryContainer.innerHTML = `
+    <div class="attendance-empty-card mystery-empty-card">
+      <div class="empty-icon-circle">${isExpired ? '⚠️' : '🎓'}</div>
+      <h3>${title}</h3>
+      <p>${desc}</p>
+      <button type="button" id="btnOpenMysteryPortal" class="open-portal-btn">Open Newton Portal</button>
+    </div>
+  `;
+
+  document.getElementById('btnOpenMysteryPortal')?.addEventListener('click', () => {
+    chrome.tabs.create({ url: 'https://my.newtonschool.co' });
+  });
+
+  if (mysteryHeroCount) {
+    mysteryHeroCount.textContent = '0';
+  }
+  if (mysteryBadge) {
+    mysteryBadge.textContent = isExpired ? 'Expired' : 'Login Required';
+  }
+  if (mysterySyncStatus) {
+    mysterySyncStatus.textContent = isExpired ? 'Session expired • Re-login required' : 'Not logged into portal';
+  }
+  if (btnSubmitAllMystery) {
+    btnSubmitAllMystery.style.display = 'none';
+  }
+}
+
+function formatMysteryDeadline(timestamp) {
+  if (!timestamp) return '';
+  const d = new Date(timestamp);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const isToday = d.toDateString() === now.toDateString();
+  const timeStr = d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+  if (isToday) {
+    return `Due Today, ${timeStr}`;
+  }
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (d.toDateString() === tomorrow.toDateString()) {
+    return `Due Tomorrow, ${timeStr}`;
+  }
+  const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return `Due ${dateStr}, ${timeStr}`;
+}
+
+/**
+ * Resolves the short name for a course/subject (e.g. "PSP", "S&AI", "Maths I")
+ * instead of the full institutional title.
+ */
+function getShortCourseTitle(rawName, quizzes = []) {
+  for (const q of (quizzes || [])) {
+    const shortDisplay = q?.rawItem?.course?.short_display_name || q?.rawItem?.course?.short_name;
+    if (shortDisplay) {
+      let clean = shortDisplay.replace(/\s*[-–—]\s*[A-Za-z0-9]+$/, '').trim();
+      clean = clean.replace(/\s*[-–—:]?\s*\b(Labs?|Practicals?|Pracs?|Tutorials?|Tuts?|Workshops?)\b\s*\d*$/i, '').trim();
+      if (clean) return clean;
+    }
+  }
+  return extractShortCourseName(rawName);
+}
+
+function renderMysteryUI() {
+  if (!mysteryContainer) return;
+
+  if (!currentMysteryData || !Array.isArray(currentMysteryData.quizzes)) {
+    renderMysteryEmpty();
+    return;
+  }
+
+  const { quizzes, groupedBySubject, groupedByCourse, totalCount, solvableCount, timestamp } = currentMysteryData;
+
+  // Header status
+  if (mysteryHeroCount) {
+    mysteryHeroCount.textContent = totalCount;
+  }
+  if (mysteryBadge) {
+    mysteryBadge.textContent = totalCount === 0 ? 'All Completed' : `${totalCount} ${totalCount === 1 ? 'Quiz' : 'Quizzes'}`;
+  }
+
+  if (mysterySyncStatus) {
+    const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) : 'Just now';
+    if (totalCount === 0) {
+      mysterySyncStatus.textContent = `Synced ${timeStr} • All caught up!`;
+    } else {
+      mysterySyncStatus.textContent = `Synced ${timeStr} • ${totalCount} unsubmitted ${totalCount === 1 ? 'quiz' : 'quizzes'}`;
+    }
+  }
+
+  // If 0 unsubmitted quizzes
+  if (totalCount === 0) {
+    if (btnSubmitAllMystery) {
+      btnSubmitAllMystery.style.display = 'none';
+    }
+    mysteryContainer.innerHTML = `
+      <div class="attendance-empty-card mystery-empty-card">
+        <div class="empty-icon-circle">🎉</div>
+        <h3>All Caught Up!</h3>
+        <p>No unsubmitted quizzes found across your courses. Great job staying on top of your coursework!</p>
+      </div>
+    `;
+    return;
+  }
+
+  // Update top Submit All button visibility & state
+  const solvableTotal = (quizzes || []).filter(q => q.hasAnswersInDb && !q.isSubmitted).length;
+  if (btnSubmitAllMystery) {
+    btnSubmitAllMystery.style.display = 'inline-flex';
+    btnSubmitAllMystery.disabled = solvableTotal === 0 || isMysterySubmitting;
+    btnSubmitAllMystery.title = solvableTotal === 0
+      ? 'No database answers available for remaining quizzes'
+      : `Submit all ${solvableTotal} unsolved quizzes with answers in database`;
+  }
+
+  // Render by subjects with lecture and lab separation
+  const subjectGroups = groupedBySubject || {};
+  let subjectKeys = Object.keys(subjectGroups);
+
+  // Fallback to groupedByCourse if groupedBySubject is missing (e.g. from previous cache)
+  if (subjectKeys.length === 0 && groupedByCourse) {
+    Object.keys(groupedByCourse).forEach(k => {
+      const qList = groupedByCourse[k] || [];
+      const shortKey = getShortCourseTitle(k, qList);
+      if (!subjectGroups[shortKey]) {
+        subjectGroups[shortKey] = {
+          subjectLabel: shortKey,
+          quizzes: [],
+          lectures: [],
+          labs: []
+        };
+      }
+      subjectGroups[shortKey].quizzes.push(...qList);
+      subjectGroups[shortKey].lectures.push(...qList.filter(q => !q.isPractical));
+      subjectGroups[shortKey].labs.push(...qList.filter(q => q.isPractical));
+    });
+    subjectKeys = Object.keys(subjectGroups);
+  }
+
+  let html = '';
+
+  const renderCard = (quiz) => {
+    // Dynamic deadline check & XP reduction: show half earnable points if deadline reached
+    const isPastDeadline = Boolean((quiz.deadline && Date.now() > quiz.deadline) || quiz.isPastDeadline);
+    let baseEarnable = Number(quiz.earnablePoints ?? quiz.rawXP ?? 0);
+    if (!baseEarnable) {
+      if (quiz.isPastDeadline && quiz.maxXP) {
+        baseEarnable = quiz.maxXP * 2;
+      } else {
+        baseEarnable = Number(quiz.maxXP ?? 0);
+      }
+    }
+    const displayXP = isPastDeadline ? Math.floor(baseEarnable / 2) : baseEarnable;
+
+    const cleanCourseHash = String(quiz.courseHash || '').replace(/^h\//i, '').replace(/^\/+|\/+$/g, '').trim();
+    const cleanQuizHash = String(quiz.hash || '').replace(/^h\//i, '').replace(/^\/+|\/+$/g, '').trim();
+    const quizUrl = `https://my.newtonschool.co/course/${encodeURIComponent(cleanCourseHash)}/assessment/${encodeURIComponent(cleanQuizHash)}`;
+
+    return `
+      <div class="mystery-quiz-card" id="quiz-card-${quiz.hash}">
+        <div class="quiz-card-header">
+          <div class="quiz-title-row">
+            <h4 class="quiz-title clickable-quiz-title" data-url="${quizUrl}" title="Click to open quiz in Newton School">${escapeHtml(quiz.title)}</h4>
+          </div>
+          <div class="quiz-xp-badge" title="${isPastDeadline ? `Past deadline: 50% XP (${displayXP} of ${baseEarnable} XP)` : `Earnable: ${displayXP} XP`}">
+            <svg class="xp-icon" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+            <span>${displayXP} XP</span>
+          </div>
+        </div>
+
+        <div class="quiz-card-body-row">
+          <div class="quiz-card-left-col">
+            <div class="quiz-meta-row">
+              ${isPastDeadline ? `
+                <span class="quiz-deadline-tag tag-past-deadline" title="Past deadline - earnable XP reduced to half">Past Deadline</span>
+              ` : ''}
+              <div class="quiz-stat" title="Total number of questions">
+                <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                  <line x1="16" y1="13" x2="8" y2="13"/>
+                  <line x1="16" y1="17" x2="8" y2="17"/>
+                </svg>
+                <span>${quiz.totalQuestions} Questions</span>
+              </div>
+
+              ${!isPastDeadline && quiz.deadline ? `
+                <div class="quiz-stat quiz-stat-deadline" title="Submission deadline">
+                  <svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                  </svg>
+                  <span>${formatMysteryDeadline(quiz.deadline)}</span>
+                </div>
+              ` : ''}
+            </div>
+
+            <!-- Status feedback message placed directly below number of questions -->
+            <div class="quiz-status-feedback" id="quiz-status-${quiz.hash}" style="display: none;"></div>
+          </div>
+
+          <div class="quiz-action-col">
+            ${quiz.hasAnswersInDb ? `
+              <button type="button" class="mystery-btn mystery-btn-submit" data-hash="${quiz.hash}" data-course="${quiz.courseHash}" title="Auto-submit quiz with answers from database">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                <span>Submit</span>
+              </button>
+            ` : `
+              <button type="button" class="mystery-btn mystery-btn-solve" data-url="${quizUrl}" title="Open quiz on Newton School to solve">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+                  <polyline points="15 3 21 3 21 9"/>
+                  <line x1="10" y1="14" x2="21" y2="3"/>
+                </svg>
+                <span>Solve</span>
+              </button>
+            `}
+          </div>
+        </div>
+      </div>
+    `;
+  };
+
+  subjectKeys.forEach(subjectKey => {
+    const group = subjectGroups[subjectKey];
+    if (!group || (!group.quizzes || group.quizzes.length === 0)) return;
+
+    const subjectTitle = getShortCourseTitle(group.subjectLabel || subjectKey, group.quizzes);
+    const lectures = group.lectures || [];
+    const labs = group.labs || [];
+    const totalSubjectQuizzes = (group.quizzes || []).length;
+    const solvableInSubject = (group.quizzes || []).filter(q => q.hasAnswersInDb && !q.isSubmitted);
+    const hasSolvableInSubject = solvableInSubject.length > 0;
+    const subjectBtnLabel = solvableInSubject.length === totalSubjectQuizzes ? 'Submit All' : `Submit ${solvableInSubject.length}`;
+
+    let componentsHtml = '';
+    const hasLectures = lectures.length > 0;
+    const hasLabs = labs.length > 0;
+
+    if (hasLectures) {
+      componentsHtml += `
+        <div class="mystery-component-group">
+          <div class="mystery-component-header">
+            <span class="mystery-component-title">
+              <svg class="component-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+              Theory Lectures
+            </span>
+            <span class="mystery-count-circle">${lectures.length}</span>
+          </div>
+          <div class="mystery-cards-list">
+            ${lectures.map(renderCard).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    if (hasLabs) {
+      componentsHtml += `
+        <div class="mystery-component-group" style="${hasLectures ? 'margin-top: 14px;' : ''}">
+          <div class="mystery-component-header">
+            <span class="mystery-component-title">
+              <svg class="component-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M10 2v7.31L4.69 18.2A2 2 0 0 0 6.4 21h11.2a2 2 0 0 0 1.71-2.8L14 9.31V2"/>
+                <path d="M8.5 2h7M7 16h10"/>
+              </svg>
+              Lab / Practical
+            </span>
+            <span class="mystery-count-circle">${labs.length}</span>
+          </div>
+          <div class="mystery-cards-list">
+            ${labs.map(renderCard).join('')}
+          </div>
+        </div>
+      `;
+    }
+
+    html += `
+      <details class="meal-card mystery-course-card" ${subjectKeys.indexOf(subjectKey) === 0 ? 'open' : ''} id="course-card-${escapeHtml(subjectKey)}">
+        <summary class="meal-card-header mystery-course-summary">
+          <div class="meal-header-left">
+            <div class="meal-icon-wrapper meal-icon-dinner">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+              </svg>
+            </div>
+            <div class="meal-info">
+              <div class="meal-title-row">
+                <span class="meal-title mystery-course-title" title="${escapeHtml(subjectTitle)}">${escapeHtml(subjectTitle)}</span>
+                <span class="mystery-count-circle" id="subject-badge-${escapeHtml(subjectKey)}">${totalSubjectQuizzes}</span>
+              </div>
+              <span class="meal-time">${hasLectures && hasLabs ? 'Theory & Lab Components' : (hasLabs ? 'Lab / Practical Component' : 'Theory Lectures')}</span>
+            </div>
+          </div>
+          <div class="mystery-summary-actions">
+            ${hasSolvableInSubject ? `
+              <button type="button" class="mystery-subject-submit-btn" data-subject="${escapeHtml(subjectKey)}" ${isMysterySubmitting ? 'disabled' : ''} title="Submit ${solvableInSubject.length} unsolved quizzes for ${escapeHtml(subjectTitle)}">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                <span>${escapeHtml(subjectBtnLabel)}</span>
+              </button>
+            ` : ''}
+            <span class="meal-toggle-btn" aria-hidden="true">
+              <svg class="chevron-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </span>
+          </div>
+        </summary>
+
+        <div class="meal-card-body mystery-course-body">
+          ${componentsHtml}
+        </div>
+      </details>
+    `;
+  });
+
+  mysteryContainer.innerHTML = html;
+
+  // Direct click listeners on subject submit buttons to prevent details toggle
+  mysteryContainer.querySelectorAll('.mystery-subject-submit-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (btn.disabled || isMysterySubmitting) return;
+
+      const subjectKey = btn.getAttribute('data-subject');
+      const group = currentMysteryData?.groupedBySubject?.[subjectKey];
+      const subjectQuizzes = (group?.quizzes || (currentMysteryData?.quizzes || []).filter(q => q.subjectKey === subjectKey || q.subjectLabel === subjectKey)).filter(q => !q.isSubmitted);
+      await submitQuizzesBatch(subjectQuizzes, btn, subjectKey);
+    });
+  });
+}
+
+async function loadMysteryData(forceSync = false) {
+  if (isMysteryLoading) return;
+  isMysteryLoading = true;
+
+  // 1. Check local storage cache for instant rendering
+  let cached = null;
+  try {
+    cached = await chrome.storage.local.get(['nst_mystery_data']);
+  } catch (e) {}
+
+  const hasCache = cached && cached.nst_mystery_data && Array.isArray(cached.nst_mystery_data.quizzes);
+  if (hasCache && !currentMysteryData) {
+    currentMysteryData = cached.nst_mystery_data;
+    renderMysteryUI();
+  }
+
+  // 2. Refresh from LMS if needed or forceSync
+  if (forceSync || !hasCache) {
+    btnRefreshMystery?.classList.add('spinning');
+    if (!hasCache && mysteryContainer) {
+      mysteryContainer.innerHTML = `
+        <div class="mess-loading-state">
+          <div class="loading-spinner"></div>
+          <span>Checking unsubmitted quizzes...</span>
+        </div>
+      `;
+    }
+    if (mysterySyncStatus) {
+      mysterySyncStatus.textContent = 'Checking unsubmitted quizzes...';
+    }
+
+    try {
+      const creds = await getPortalAuthCredentials();
+      if (!creds || !creds.token) {
+        btnRefreshMystery?.classList.remove('spinning');
+        isMysteryLoading = false;
+        if (!hasCache) {
+          renderMysteryEmpty();
+        } else {
+          showStatus('Please log into portal to refresh', false);
+        }
+        return;
+      }
+
+      const freshData = await fetchUnsubmittedQuizzes({
+        token: creds.token,
+        preferredCourseHash: creds.courseHash
+      });
+
+      freshData.timestamp = Date.now();
+      currentMysteryData = freshData;
+      await chrome.storage.local.set({ nst_mystery_data: freshData });
+      renderMysteryUI();
+
+      if (forceSync) {
+        showStatus('Quizzes refreshed from portal');
+      }
+    } catch (err) {
+      console.warn('[newNewton] Mystery quizzes load failed:', err);
+      if (err.message === 'AUTH_EXPIRED') {
+        renderMysteryEmpty('Your Newton School portal session has expired. Please log in again to sync quizzes.', true);
+      } else if (!hasCache) {
+        renderMysteryEmpty(`Could not load quizzes (${err.message || 'Network error'}). Please ensure you are logged into the portal.`);
+      } else {
+        showStatus('Sync failed: ' + (err.message || 'Network error'), false);
+      }
+    } finally {
+      btnRefreshMystery?.classList.remove('spinning');
+      isMysteryLoading = false;
+    }
+  } else {
+    isMysteryLoading = false;
+  }
+}
+
+function initMystery() {
+  loadMysteryData(false);
+  checkOngoingSubmission();
+}
+
+// ========================================================
+// 10b. LAZY SUBMIT & LIVE PROGRESS CONTROLLERS
+// ========================================================
+
+function formatDelayDisplay(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
+function formatEntropyDisplay(seconds) {
+  if (seconds === 0) return '±0s (Off)';
+  if (seconds < 60) return `±${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return s > 0 ? `±${m}m ${s}s` : `±${m}m`;
+}
+
+function cancellableDelay(durationMs, onTick, checkCancelled) {
+  return new Promise((resolve) => {
+    let timerId = null;
+    let intervalId = null;
+    const startTime = Date.now();
+
+    const cleanup = () => {
+      if (timerId) clearTimeout(timerId);
+      if (intervalId) clearInterval(intervalId);
+      if (activeWaitResolver === triggerEarlyResolve) {
+        activeWaitResolver = null;
+      }
+    };
+
+    const triggerEarlyResolve = () => {
+      cleanup();
+      resolve(true);
+    };
+
+    activeWaitResolver = triggerEarlyResolve;
+
+    if (durationMs <= 0 || (checkCancelled && checkCancelled())) {
+      cleanup();
+      resolve(true);
+      return;
+    }
+
+    intervalId = setInterval(() => {
+      if (checkCancelled && checkCancelled()) {
+        cleanup();
+        resolve(true);
+        return;
+      }
+      const elapsed = Date.now() - startTime;
+      const remaining = Math.max(0, durationMs - elapsed);
+      if (onTick) onTick(elapsed, remaining);
+      if (remaining <= 0) {
+        cleanup();
+        resolve(true);
+      }
+    }, 100);
+
+    timerId = setTimeout(() => {
+      cleanup();
+      resolve(true);
+    }, durationMs);
+  });
+}
+
+function triggerSubmitNow() {
+  skipRemainingDelay = true;
+  if (typeof activeWaitResolver === 'function') {
+    activeWaitResolver();
+  }
+  if (liveStatusText) {
+    liveStatusText.textContent = 'Submitting remaining without delay...';
+  }
+}
+
+function triggerStopSubmission() {
+  isSubmissionStopped = true;
+  if (typeof activeWaitResolver === 'function') {
+    activeWaitResolver();
+  }
+  if (liveStatusText) {
+    liveStatusText.textContent = 'Stopping submission...';
+  }
+  showStatus('Submission stopped by user', false);
+}
+
+function showLiveBanner(quizTitle = 'Quiz', initialMessage = 'Preparing attempt...') {
+  if (mysteryLiveBanner) {
+    mysteryLiveBanner.style.display = 'block';
+  }
+  if (liveQuizTitle) {
+    liveQuizTitle.textContent = `Submitting "${quizTitle}"`;
+  }
+  if (liveStatusText) {
+    liveStatusText.textContent = initialMessage;
+  }
+  if (liveProgressBar) {
+    liveProgressBar.style.width = '0%';
+  }
+}
+
+function hideLiveBanner() {
+  if (mysteryLiveBanner) {
+    mysteryLiveBanner.style.display = 'none';
+  }
+  if (liveProgressBar) {
+    liveProgressBar.style.width = '0%';
+  }
+  activeWaitResolver = null;
+}
+
+// ========================================================
+// 10c. AUDIO NOTIFICATION CONTROLLER
+// ========================================================
+
+let sharedAudioCtx = null;
+
+/**
+ * Pre-warms the AudioContext during direct user click gestures
+ * so modern browsers reliably allow audio playback even after long lazy-submit delays.
+ */
+function primeAudioContext() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+      sharedAudioCtx = new AudioContextClass();
+    }
+    if (sharedAudioCtx.state === 'suspended') {
+      sharedAudioCtx.resume();
+    }
+  } catch (e) {
+    // AudioContext initialization caught safely
+  }
+}
+
+/**
+ * Plays a pleasant ascending completion chime (E5 -> G#5 -> B5 -> E6)
+ * when quiz submission finishes.
+ */
+function playCompletionSound() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    if (!sharedAudioCtx || sharedAudioCtx.state === 'closed') {
+      sharedAudioCtx = new AudioContextClass();
+    }
+
+    if (sharedAudioCtx.state === 'suspended') {
+      sharedAudioCtx.resume();
+    }
+
+    const ctx = sharedAudioCtx;
+    const now = ctx.currentTime;
+
+    // Harmonious major-chord ascending chime: E5 (659.25Hz), G#5 (830.61Hz), B5 (987.77Hz), E6 (1318.51Hz)
+    const notes = [
+      { freq: 659.25, start: 0.00, duration: 0.14, gain: 0.22 },
+      { freq: 830.61, start: 0.09, duration: 0.14, gain: 0.22 },
+      { freq: 987.77, start: 0.18, duration: 0.16, gain: 0.25 },
+      { freq: 1318.51, start: 0.27, duration: 0.42, gain: 0.28 }
+    ];
+
+    notes.forEach(({ freq, start, duration, gain: peakGain }) => {
+      const osc = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + start);
+
+      // Bell envelope: rapid attack, smooth exponential decay
+      gainNode.gain.setValueAtTime(0.0001, now + start);
+      gainNode.gain.exponentialRampToValueAtTime(peakGain, now + start + 0.02);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, now + start + duration);
+
+      osc.connect(gainNode);
+      gainNode.connect(ctx.destination);
+
+      osc.start(now + start);
+      osc.stop(now + start + duration);
+    });
+  } catch (err) {
+    console.warn('[newNewton] Could not play completion chime:', err);
+  }
+}
+
+async function initLazySubmitSettings() {
+  try {
+    const saved = await chrome.storage.local.get([
+      'nst_lazy_submit_enabled',
+      'nst_lazy_submit_delay',
+      'nst_lazy_submit_entropy'
+    ]);
+
+    isLazySubmitEnabled = Boolean(saved.nst_lazy_submit_enabled);
+    currentLazyDelay = typeof saved.nst_lazy_submit_delay === 'number' ? saved.nst_lazy_submit_delay : 15;
+    currentLazyEntropy = typeof saved.nst_lazy_submit_entropy === 'number' ? saved.nst_lazy_submit_entropy : 5;
+
+    // Constraint: entropy cannot be more than delay
+    if (currentLazyEntropy > currentLazyDelay) {
+      currentLazyEntropy = currentLazyDelay;
+    }
+
+    if (toggleLazySubmit) {
+      toggleLazySubmit.checked = isLazySubmitEnabled;
+    }
+    if (lazyStatusPill) {
+      lazyStatusPill.textContent = isLazySubmitEnabled ? 'Active' : 'Off';
+      lazyStatusPill.classList.toggle('active', isLazySubmitEnabled);
+    }
+    if (lazySlidersContainer) {
+      lazySlidersContainer.style.display = isLazySubmitEnabled ? 'flex' : 'none';
+    }
+
+    if (delaySlider) {
+      delaySlider.value = secondsToSliderPos(currentLazyDelay, 1, 1000);
+    }
+    if (delayValBadge) {
+      delayValBadge.textContent = formatDelayDisplay(currentLazyDelay);
+    }
+
+    if (entropySlider) {
+      entropySlider.value = secondsToSliderPos(currentLazyEntropy, 0, 1000);
+    }
+    if (entropyValBadge) {
+      entropyValBadge.textContent = formatEntropyDisplay(currentLazyEntropy);
+    }
+  } catch (e) {
+    console.warn('[newNewton] Failed to load lazy submit settings:', e);
+  }
+}
+
+// Toggle Lazy Submit
+toggleLazySubmit?.addEventListener('change', async (e) => {
+  isLazySubmitEnabled = Boolean(e.target.checked);
+  if (lazyStatusPill) {
+    lazyStatusPill.textContent = isLazySubmitEnabled ? 'Active' : 'Off';
+    lazyStatusPill.classList.toggle('active', isLazySubmitEnabled);
+  }
+  if (lazySlidersContainer) {
+    lazySlidersContainer.style.display = isLazySubmitEnabled ? 'flex' : 'none';
+  }
+  try {
+    await chrome.storage.local.set({ nst_lazy_submit_enabled: isLazySubmitEnabled });
+  } catch (err) {}
+});
+
+// Delay Slider
+delaySlider?.addEventListener('input', (e) => {
+  currentLazyDelay = sliderPosToSeconds(e.target.value, 1, 1000);
+  if (delayValBadge) {
+    delayValBadge.textContent = formatDelayDisplay(currentLazyDelay);
+  }
+  // Constraint: entropy cannot be more than delay
+  if (currentLazyEntropy > currentLazyDelay) {
+    currentLazyEntropy = currentLazyDelay;
+    if (entropySlider) {
+      entropySlider.value = secondsToSliderPos(currentLazyEntropy, 0, 1000);
+    }
+    if (entropyValBadge) {
+      entropyValBadge.textContent = formatEntropyDisplay(currentLazyEntropy);
+    }
+  }
+});
+delaySlider?.addEventListener('change', async () => {
+  try {
+    await chrome.storage.local.set({
+      nst_lazy_submit_delay: currentLazyDelay,
+      nst_lazy_submit_entropy: currentLazyEntropy
+    });
+  } catch (e) {}
+});
+
+// Entropy Slider
+entropySlider?.addEventListener('input', (e) => {
+  const selectedEntropy = sliderPosToSeconds(e.target.value, 0, 1000);
+  // Constraint: entropy cannot be more than delay
+  if (selectedEntropy > currentLazyDelay) {
+    currentLazyEntropy = currentLazyDelay;
+    entropySlider.value = secondsToSliderPos(currentLazyDelay, 0, 1000);
+  } else {
+    currentLazyEntropy = selectedEntropy;
+  }
+  if (entropyValBadge) {
+    entropyValBadge.textContent = formatEntropyDisplay(currentLazyEntropy);
+  }
+});
+entropySlider?.addEventListener('change', async () => {
+  try {
+    await chrome.storage.local.set({ nst_lazy_submit_entropy: currentLazyEntropy });
+  } catch (e) {}
+});
+
+// Pause / Resume Button (Requirement 7)
+btnPauseResume?.addEventListener('click', async () => {
+  const isPaused = btnPauseResume.classList.contains('is-paused');
+  if (isPaused) {
+    await chrome.runtime.sendMessage({ action: 'RESUME_SUBMISSION' });
+    btnPauseResume.classList.remove('is-paused');
+    btnPauseResume.title = 'Pause submission';
+    btnPauseResume.innerHTML = `
+      <svg class="live-action-icon icon-pause" viewBox="0 0 24 24" fill="currentColor">
+        <rect x="6" y="4" width="4" height="16" rx="1.5"></rect>
+        <rect x="14" y="4" width="4" height="16" rx="1.5"></rect>
+      </svg>
+    `;
+    if (liveStatusText) {
+      liveStatusText.textContent = 'Resuming submission...';
+    }
+  } else {
+    await chrome.runtime.sendMessage({ action: 'PAUSE_SUBMISSION' });
+    btnPauseResume.classList.add('is-paused');
+    btnPauseResume.title = 'Resume submission';
+    btnPauseResume.innerHTML = `
+      <svg class="live-action-icon icon-play" viewBox="0 0 24 24" fill="currentColor">
+        <polygon points="6 4 20 12 6 20 6 4"></polygon>
+      </svg>
+    `;
+    if (liveStatusText) {
+      liveStatusText.textContent = 'Submission paused';
+    }
+  }
+});
+
+// Fast Forward Button with confirmation warning
+btnFastForward?.addEventListener('click', async () => {
+  const confirmed = confirm('Are you sure you want to fast-forward? All remaining questions will be submitted immediately without human-like delays.');
+  if (!confirmed) return;
+  await chrome.runtime.sendMessage({ action: 'FAST_FORWARD_SUBMISSION' });
+  triggerSubmitNow();
+});
+
+// Stop Submission Button
+btnStopSubmission?.addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ action: 'STOP_SUBMISSION' });
+  triggerStopSubmission();
+});
+
+// ========================================================
+// 11. QUIZ CARD REMOVAL & BATCH SUBMISSION CONTROLLERS
+// ========================================================
+
+/**
+ * Removes a quiz card using a card-slide transition, updates badge counts,
+ * and clears empty component groups and subject containers.
+ */
+async function slideOutAndRemoveCard(assessmentHash, subjectLabel = null, isPractical = false) {
+  const cardEl = document.getElementById(`quiz-card-${assessmentHash}`);
+  if (cardEl) {
+    cardEl.classList.add('card-slide-out');
+    await new Promise(r => setTimeout(r, 430));
+
+    const cardsList = cardEl.closest('.mystery-cards-list');
+    const compGroup = cardEl.closest('.mystery-component-group');
+    const courseCard = cardEl.closest('.mystery-course-card');
+
+    cardEl.remove();
+
+    // 1. Update component group badge and remove if empty
+    if (cardsList && compGroup) {
+      const remainingInGroup = cardsList.querySelectorAll('.mystery-quiz-card').length;
+      const compBadge = compGroup.querySelector('.mystery-count-circle');
+      if (compBadge) {
+        compBadge.textContent = remainingInGroup;
+      }
+      if (remainingInGroup === 0) {
+        compGroup.remove();
+      }
+    }
+
+    // 2. Update subject card badge and remove/collapse if empty
+    if (courseCard) {
+      const remainingInSubject = courseCard.querySelectorAll('.mystery-quiz-card').length;
+      const subjBadge = courseCard.querySelector('.mystery-count-circle');
+      if (subjBadge) {
+        subjBadge.textContent = remainingInSubject;
+      }
+      const subjSubmitBtn = courseCard.querySelector('.mystery-subject-submit-btn');
+      const remainingSolvableInSubj = courseCard.querySelectorAll('.mystery-btn-submit').length;
+      if (subjSubmitBtn && remainingSolvableInSubj === 0) {
+        subjSubmitBtn.remove();
+      }
+      if (remainingInSubject === 0) {
+        courseCard.classList.add('card-slide-out');
+        await new Promise(r => setTimeout(r, 350));
+        courseCard.remove();
+      }
+    }
+  }
+
+  // 3. Update memory data model
+  if (currentMysteryData) {
+    const targetQ = (currentMysteryData.quizzes || []).find(q => q.hash === assessmentHash);
+    if (targetQ) {
+      targetQ.isSubmitted = true;
+    }
+    currentMysteryData.quizzes = (currentMysteryData.quizzes || []).filter(q => q.hash !== assessmentHash && !q.isSubmitted);
+    currentMysteryData.totalCount = currentMysteryData.quizzes.length;
+    currentMysteryData.solvableCount = currentMysteryData.quizzes.filter(q => q.hasAnswersInDb).length;
+
+    // Clean up groupedBySubject
+    if (currentMysteryData.groupedBySubject) {
+      Object.keys(currentMysteryData.groupedBySubject).forEach(sk => {
+        const grp = currentMysteryData.groupedBySubject[sk];
+        if (grp) {
+          grp.quizzes = (grp.quizzes || []).filter(q => q.hash !== assessmentHash && !q.isSubmitted);
+          grp.lectures = (grp.lectures || []).filter(q => q.hash !== assessmentHash && !q.isSubmitted);
+          grp.labs = (grp.labs || []).filter(q => q.hash !== assessmentHash && !q.isSubmitted);
+          if (grp.quizzes.length === 0) {
+            delete currentMysteryData.groupedBySubject[sk];
+          }
+        }
+      });
+    }
+
+    try {
+      await chrome.storage.local.set({ nst_mystery_data: currentMysteryData });
+    } catch (e) {}
+  }
+
+  // 4. Update header status and badges
+  updateMysteryHeaderBadges();
+}
+
+/**
+ * Updates top tab badges, sync status, and enables/disables batch submit buttons.
+ */
+function updateMysteryHeaderBadges() {
+  if (!currentMysteryData) return;
+  const remainingQuizzes = (currentMysteryData.quizzes || []).filter(q => !q.isSubmitted);
+  const remainingCount = remainingQuizzes.length;
+  currentMysteryData.totalCount = remainingCount;
+  currentMysteryData.solvableCount = remainingQuizzes.filter(q => q.hasAnswersInDb).length;
+
+  if (mysteryHeroCount) {
+    mysteryHeroCount.textContent = remainingCount;
+  }
+  if (mysteryBadge) {
+    mysteryBadge.textContent = remainingCount === 0 ? 'All Completed' : `${remainingCount} ${remainingCount === 1 ? 'Quiz' : 'Quizzes'}`;
+  }
+  if (mysterySyncStatus) {
+    if (remainingCount === 0) {
+      mysterySyncStatus.textContent = 'All caught up!';
+    } else {
+      mysterySyncStatus.textContent = `${remainingCount} unsubmitted ${remainingCount === 1 ? 'quiz' : 'quizzes'}`;
+    }
+  }
+
+  if (btnSubmitAllMystery) {
+    if (remainingCount === 0) {
+      btnSubmitAllMystery.style.display = 'none';
+    } else {
+      btnSubmitAllMystery.style.display = 'inline-flex';
+      btnSubmitAllMystery.disabled = currentMysteryData.solvableCount === 0 || isMysterySubmitting;
+      const allText = currentMysteryData.solvableCount === remainingCount ? 'Submit All' : `Submit ${currentMysteryData.solvableCount}`;
+      const spanEl = btnSubmitAllMystery.querySelector('span');
+      if (spanEl) spanEl.textContent = allText;
+      btnSubmitAllMystery.title = currentMysteryData.solvableCount === 0
+        ? 'No answers in database for remaining quizzes'
+        : (currentMysteryData.solvableCount === remainingCount
+            ? `Submit all ${remainingCount} unsolved quizzes with answers in database`
+            : `Submit ${currentMysteryData.solvableCount} unsolved quizzes with available answers`);
+    }
+  }
+
+  // Update subject submit buttons based on remaining solvable in each subject
+  document.querySelectorAll('.mystery-subject-submit-btn').forEach(sBtn => {
+    const sKey = sBtn.getAttribute('data-subject');
+    const sQuizzes = (currentMysteryData.quizzes || []).filter(q => (q.subjectKey === sKey || q.subjectLabel === sKey) && !q.isSubmitted);
+    const sSolvable = sQuizzes.filter(q => q.hasAnswersInDb).length;
+    if (sSolvable === 0) {
+      sBtn.remove();
+    } else {
+      sBtn.style.display = 'inline-flex';
+      sBtn.disabled = isMysterySubmitting;
+      const sText = sSolvable === sQuizzes.length ? 'Submit All' : `Submit ${sSolvable}`;
+      const sSpan = sBtn.querySelector('span');
+      if (sSpan) sSpan.textContent = sText;
+      sBtn.title = `Submit ${sSolvable} unsolved quizzes for ${sKey}`;
+    }
+  });
+
+  if (remainingCount === 0 && mysteryContainer) {
+    mysteryContainer.innerHTML = `
+      <div class="attendance-empty-card mystery-empty-card">
+        <div class="empty-icon-circle">🎉</div>
+        <h3>All Caught Up!</h3>
+        <p>No unsubmitted quizzes found across your courses. Great job staying on top of your coursework!</p>
+      </div>
+    `;
+  }
+}
+
+/**
+ * Executes sequential submission of an array of quizzes with UI feedback,
+ * sliding cards out upon completion.
+ */
+/**
+ * Executes sequential submission of an array of quizzes with UI feedback,
+ * delegating execution to the background service worker so it continues even if the popup closes.
+ */
+async function submitQuizzesBatch(quizzesToSubmit, triggerBtn = null, batchName = 'quizzes') {
+  primeAudioContext();
+  if (isMysterySubmitting) return;
+
+  if (!Array.isArray(quizzesToSubmit) || quizzesToSubmit.length === 0) {
+    showStatus('No quizzes to submit', false);
+    return;
+  }
+
+  const solvable = quizzesToSubmit.filter(q => q.hasAnswersInDb && !q.isSubmitted);
+  if (solvable.length === 0) {
+    showStatus(`No database solutions available for ${batchName}`, false);
+    return;
+  }
+
+  // Warn using confirm() before user submits with lazy submit OFF
+  if (!isLazySubmitEnabled) {
+    const confirmed = confirm('Lazy Submit is turned OFF. Quizzes will be submitted instantly to Newton School without any human-like delays. Are you sure you want to proceed?');
+    if (!confirmed) return;
+  }
+
+  isMysterySubmitting = true;
+  skipRemainingDelay = false;
+  isSubmissionStopped = false;
+
+  const originalHtml = triggerBtn ? triggerBtn.innerHTML : '';
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.classList.add('is-loading');
+    triggerBtn.innerHTML = `
+      <div class="loading-spinner" style="width: 10px; height: 10px; border-width: 1.5px;"></div>
+      <span>0/${solvable.length}</span>
+    `;
+  }
+
+  // Disable all submit buttons during batch
+  document.querySelectorAll('.mystery-btn-submit, .mystery-subject-submit-btn, #btnSubmitAllMystery').forEach(b => {
+    b.disabled = true;
+  });
+
+  if (isLazySubmitEnabled && lazyKeepBrowserOpenNote) {
+    lazyKeepBrowserOpenNote.style.display = 'flex';
+  }
+
+  showLiveBanner(solvable[0]?.title || 'Quiz Assessment', `Connecting to background worker (0/${solvable.length})...`);
+
+  try {
+    const creds = await getPortalAuthCredentials();
+    if (!creds || !creds.token) {
+      throw new Error('No authentication token found. Please log in to Newton School.');
+    }
+
+    // Hand off sequential submission to background worker (so popup closing won't stop it!)
+    const response = await chrome.runtime.sendMessage({
+      action: 'START_SUBMISSION',
+      token: creds.token,
+      quizzes: solvable,
+      lazySettings: {
+        enabled: isLazySubmitEnabled,
+        delay: currentLazyDelay,
+        entropy: currentLazyEntropy
+      },
+      batchName
+    });
+
+    if (response && response.state) {
+      handleSubmissionStateUpdate(response.state);
+    }
+  } catch (err) {
+    console.error('[newNewton] Failed to initiate background submission:', err);
+    showStatus('Submission failed: ' + (err.message || 'Error'), false);
+    isMysterySubmitting = false;
+    hideLiveBanner();
+    if (lazyKeepBrowserOpenNote) {
+      lazyKeepBrowserOpenNote.style.display = 'none';
+    }
+    if (triggerBtn) {
+      triggerBtn.classList.remove('is-loading');
+      triggerBtn.innerHTML = originalHtml;
+    }
+    document.querySelectorAll('.mystery-btn-submit, .mystery-subject-submit-btn, #btnSubmitAllMystery').forEach(b => {
+      b.disabled = false;
+    });
+    updateMysteryHeaderBadges();
+  }
+}
+
+/**
+ * Handles live updates from background submission manager
+ */
+function handleSubmissionStateUpdate(state) {
+  if (!state) return;
+
+  if (state.status === 'running' || state.status === 'paused') {
+    isMysterySubmitting = true;
+    showLiveBanner(
+      state.currentQuiz?.title || 'Quiz Assessment',
+      state.currentProgress?.message || (state.isPaused ? 'Submission paused' : 'Submitting in background...')
+    );
+
+    if (state.lazySettings?.enabled && lazyKeepBrowserOpenNote) {
+      lazyKeepBrowserOpenNote.style.display = 'flex';
+    }
+
+    // Update Pause / Resume Button (Requirement 7)
+    if (btnPauseResume) {
+      if (state.isPaused) {
+        btnPauseResume.classList.add('is-paused');
+        btnPauseResume.title = 'Resume submission';
+        btnPauseResume.innerHTML = `
+          <svg class="live-action-icon icon-play" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="6 4 20 12 6 20 6 4"></polygon>
+          </svg>
+        `;
+      } else {
+        btnPauseResume.classList.remove('is-paused');
+        btnPauseResume.title = 'Pause submission';
+        btnPauseResume.innerHTML = `
+          <svg class="live-action-icon icon-pause" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="6" y="4" width="4" height="16" rx="1.5"></rect>
+            <rect x="14" y="4" width="4" height="16" rx="1.5"></rect>
+          </svg>
+        `;
+      }
+    }
+
+    // Update progress bar
+    if (liveProgressBar && state.currentProgress?.total) {
+      const p = state.currentProgress;
+      const stepFrac = p.delaySec ? Math.max(0, 1 - (p.remainingSec / p.delaySec)) : 0;
+      const pct = Math.min(99, Math.round(((p.current - 1 + stepFrac) / p.total) * 100));
+      liveProgressBar.style.width = `${pct}%`;
+    }
+
+    // Update current quiz card feedback
+    if (state.currentQuiz?.hash) {
+      const cardFeedback = document.getElementById(`quiz-status-${state.currentQuiz.hash}`);
+      if (cardFeedback) {
+        cardFeedback.style.display = 'inline-flex';
+        cardFeedback.className = 'quiz-status-feedback status-progress';
+        cardFeedback.textContent = state.currentProgress?.message || 'Auto-submitting...';
+      }
+    }
+
+    // Disable submit buttons while active
+    document.querySelectorAll('.mystery-btn-submit, .mystery-subject-submit-btn, #btnSubmitAllMystery').forEach(b => {
+      b.disabled = true;
+    });
+  } else if (state.status === 'completed') {
+    const wasSubmitting = isMysterySubmitting;
+    isMysterySubmitting = false;
+    hideLiveBanner();
+    if (lazyKeepBrowserOpenNote) {
+      lazyKeepBrowserOpenNote.style.display = 'none';
+    }
+    if (wasSubmitting && state.successCount > 0) {
+      playCompletionSound();
+      showStatus(`Submitted ${state.successCount} quizzes!`);
+    }
+    document.querySelectorAll('.mystery-btn-submit, .mystery-subject-submit-btn, #btnSubmitAllMystery').forEach(b => {
+      b.disabled = false;
+    });
+    updateMysteryHeaderBadges();
+  } else if (state.status === 'stopped') {
+    isMysterySubmitting = false;
+    hideLiveBanner();
+    if (lazyKeepBrowserOpenNote) {
+      lazyKeepBrowserOpenNote.style.display = 'none';
+    }
+    if (state.currentQuiz?.hash) {
+      const cardFeedback = document.getElementById(`quiz-status-${state.currentQuiz.hash}`);
+      if (cardFeedback) {
+        cardFeedback.style.display = 'inline-flex';
+        cardFeedback.className = 'quiz-status-feedback status-error';
+        cardFeedback.textContent = 'Submission stopped';
+      }
+    }
+    showStatus('Submission stopped by user', false);
+    document.querySelectorAll('.mystery-btn-submit, .mystery-subject-submit-btn, #btnSubmitAllMystery').forEach(b => {
+      b.disabled = false;
+    });
+    updateMysteryHeaderBadges();
+  }
+}
+
+// Background submission runtime message listener
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.action === 'SUBMISSION_STATE_UPDATE') {
+    handleSubmissionStateUpdate(msg.state);
+  } else if (msg.action === 'QUIZ_SUBMITTED_SUCCESS') {
+    slideOutAndRemoveCard(msg.quizHash, msg.subjectLabel, msg.isPractical);
+  } else if (msg.action === 'QUIZ_SUBMITTED_ERROR') {
+    const cardFeedback = document.getElementById(`quiz-status-${msg.quizHash}`);
+    if (cardFeedback) {
+      cardFeedback.style.display = 'inline-flex';
+      cardFeedback.className = 'quiz-status-feedback status-error';
+      cardFeedback.textContent = `Failed: ${msg.error || 'Error'}`;
+    }
+  }
+});
+
+// Check if a background submission is already ongoing when popup opens
+async function checkOngoingSubmission() {
+  try {
+    const res = await chrome.runtime.sendMessage({ action: 'GET_SUBMISSION_STATE' });
+    if (res && res.state) {
+      handleSubmissionStateUpdate(res.state);
+    }
+  } catch (e) {}
+}
+
+// Refresh Mystery Quizzes Button
+btnRefreshMystery?.addEventListener('click', () => {
+  loadMysteryData(true);
+});
+
+// Top Submit All Unsolved Quizzes Button
+btnSubmitAllMystery?.addEventListener('click', async () => {
+  primeAudioContext();
+  if (btnSubmitAllMystery.disabled || isMysterySubmitting) return;
+  const quizzes = (currentMysteryData?.quizzes || []).filter(q => !q.isSubmitted);
+  await submitQuizzesBatch(quizzes, btnSubmitAllMystery, 'all quizzes');
+});
+
+// Event Delegation for Mystery Container (Title Click, Solve, Subject Submit, and Individual Submit)
+mysteryContainer?.addEventListener('click', async (e) => {
+  // A. Quiz Title Click -> Open quiz in new tab
+  const titleEl = e.target.closest('.clickable-quiz-title');
+  if (titleEl) {
+    const url = titleEl.getAttribute('data-url');
+    if (url) {
+      chrome.tabs.create({ url });
+    }
+    return;
+  }
+
+  // B. Solve Button Click -> Redirect to quiz
+  const solveBtn = e.target.closest('.mystery-btn-solve');
+  if (solveBtn) {
+    const url = solveBtn.getAttribute('data-url');
+    if (url) {
+      chrome.tabs.create({ url });
+    }
+    return;
+  }
+
+  // B. Subject Submit Button Click (via delegation as backup)
+  const subjectSubmitBtn = e.target.closest('.mystery-subject-submit-btn');
+  if (subjectSubmitBtn) {
+    e.preventDefault();
+    e.stopPropagation();
+    primeAudioContext();
+    if (subjectSubmitBtn.disabled || isMysterySubmitting) return;
+
+    const subjectKey = subjectSubmitBtn.getAttribute('data-subject');
+    const group = currentMysteryData?.groupedBySubject?.[subjectKey];
+    const subjectQuizzes = (group?.quizzes || (currentMysteryData?.quizzes || []).filter(q => q.subjectKey === subjectKey || q.subjectLabel === subjectKey)).filter(q => !q.isSubmitted);
+    await submitQuizzesBatch(subjectQuizzes, subjectSubmitBtn, subjectKey);
+    return;
+  }
+
+  // C. Individual Submit Button Click -> Automate solution submission
+  const submitBtn = e.target.closest('.mystery-btn-submit');
+  if (submitBtn && !submitBtn.disabled && !isMysterySubmitting) {
+    const assessmentHash = submitBtn.getAttribute('data-hash');
+    const courseHash = submitBtn.getAttribute('data-course');
+    if (!assessmentHash || !courseHash) return;
+
+    const quiz = (currentMysteryData?.quizzes || []).find(q => q.hash === assessmentHash);
+    if (!quiz) return;
+
+    await submitQuizzesBatch([quiz], submitBtn, quiz.title || 'quiz');
+    return;
+  }
+});
+
+// Auto-initialize Mess Menu, Attendance, Mystery, and Lazy Submit on start
 initMessMenu();
 initAttendance();
+initMystery();
+initLazySubmitSettings();
+
+
 

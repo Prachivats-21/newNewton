@@ -208,11 +208,23 @@
         let courseHash = (cMatch && cMatch[1] !== 'h') ? cMatch[1] : null;
         if (!courseHash) {
           try {
-            const storedCourse = localStorage.getItem('current_course') || localStorage.getItem('active_course') || localStorage.getItem('active_course_hash');
+            const storedCourse = localStorage.getItem('current_course') || localStorage.getItem('active_course') || localStorage.getItem('active_course_hash') || localStorage.getItem('course_hash');
             if (storedCourse) {
               const parsed = storedCourse.startsWith('{') ? JSON.parse(storedCourse).hash : storedCourse;
               if (parsed && parsed !== 'h') {
                 courseHash = parsed;
+              }
+            }
+          } catch (e) {}
+        }
+
+        if (!courseHash) {
+          try {
+            const courseLink = document.querySelector('a[href*="/course/"]');
+            if (courseLink) {
+              const lMatch = (courseLink.getAttribute('href') || '').match(/\/course\/(?:h\/)?([^/?#]+)/i);
+              if (lMatch && lMatch[1] !== 'h') {
+                courseHash = lMatch[1];
               }
             }
           } catch (e) {}

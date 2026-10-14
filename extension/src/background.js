@@ -8,7 +8,8 @@ import {
   handleQuizSubmissionArchival,
   checkSolutionsInSupabase,
   syncHistoricalQuizzes,
-  extractCleanAuthToken
+  extractCleanAuthToken,
+  submitQuizWithSupabaseSolutions
 } from './quiz-client.js';
 
 const RULE_ID_OFFSET = 1000;
@@ -61,36 +62,43 @@ function buildBlockingRules() {
   }));
 }
 
+let syncRulesQueue = Promise.resolve();
+
 /**
  * Enable or disable declarativeNetRequest blocking rules based on user setting
  */
-async function syncTelemetryBlockingRules(shouldBlock) {
-  if (!chrome.declarativeNetRequest) return;
+function syncTelemetryBlockingRules(shouldBlock) {
+  syncRulesQueue = syncRulesQueue.then(async () => {
+    if (!chrome.declarativeNetRequest) return;
 
-  try {
-    const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
-    const existingIds = existingRules
-      .map(r => r.id)
-      .filter(id => id >= RULE_ID_OFFSET && id < RULE_ID_OFFSET + 100);
+    try {
+      const existingRules = await chrome.declarativeNetRequest.getDynamicRules();
+      const existingIds = existingRules
+        .map(r => r.id)
+        .filter(id => id >= RULE_ID_OFFSET && id < RULE_ID_OFFSET + 200);
 
-    if (shouldBlock) {
-      const rulesToAdd = buildBlockingRules();
-      await chrome.declarativeNetRequest.updateDynamicRules({
-        removeRuleIds: existingIds,
-        addRules: rulesToAdd
-      });
-      console.log(`[Newton Enhancer] Telemetry blocking ACTIVE (${rulesToAdd.length} network rules enabled).`);
-    } else {
-      if (existingIds.length > 0) {
+      const targetIds = TELEMETRY_FILTERS.map((_, i) => RULE_ID_OFFSET + i);
+      const allRemoveIds = Array.from(new Set([...existingIds, ...targetIds]));
+
+      if (shouldBlock) {
+        const rulesToAdd = buildBlockingRules();
         await chrome.declarativeNetRequest.updateDynamicRules({
-          removeRuleIds: existingIds
+          removeRuleIds: allRemoveIds,
+          addRules: rulesToAdd
         });
+        console.log(`[Newton Enhancer] Telemetry blocking ACTIVE (${rulesToAdd.length} network rules enabled).`);
+      } else {
+        await chrome.declarativeNetRequest.updateDynamicRules({
+          removeRuleIds: allRemoveIds
+        });
+        console.log('[Newton Enhancer] Telemetry blocking DISABLED (network rules removed).');
       }
-      console.log('[Newton Enhancer] Telemetry blocking DISABLED (network rules removed).');
+    } catch (err) {
+      console.error('[Newton Enhancer] Failed to update declarativeNetRequest rules:', err);
     }
-  } catch (err) {
-    console.error('[Newton Enhancer] Failed to update declarativeNetRequest rules:', err);
-  }
+  });
+
+  return syncRulesQueue;
 }
 
 // Helper: Attempt initial historical sync if auth token is present and not yet synced
@@ -141,6 +149,10 @@ async function checkAndTriggerInitialSync(force = false) {
       : null;
 
     const res = await syncHistoricalQuizzes(token, syncState.nst_portal_uid, effectiveCourse);
+    if (res && res.status === 'PENDING_COURSE') {
+      console.log('[Newton Enhancer] Initial sync waiting for course selection. Will automatically archive once student navigates to course.');
+      return res;
+    }
     console.log('[Newton Enhancer] Initial quiz archival sync complete:', res);
     return res;
   } catch (err) {
@@ -243,4 +255,325 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+
+  // ========================================================
+  // BACKGROUND QUIZ SUBMISSION ACTIONS
+  // ========================================================
+  if (message.action === 'START_SUBMISSION') {
+    const { token, quizzes, lazySettings, batchName } = message;
+    runBackgroundSubmission(token, quizzes, lazySettings, batchName)
+      .then((state) => {
+        sendResponse({ success: true, state });
+      })
+      .catch((err) => {
+        sendResponse({ success: false, error: err.message });
+      });
+    return true;
+  }
+
+  if (message.action === 'PAUSE_SUBMISSION') {
+    submissionState.isPaused = true;
+    persistAndBroadcastSubmissionState().then(() => {
+      sendResponse({ success: true, isPaused: true });
+    });
+    return true;
+  }
+
+  if (message.action === 'RESUME_SUBMISSION') {
+    submissionState.isPaused = false;
+    persistAndBroadcastSubmissionState().then(() => {
+      sendResponse({ success: true, isPaused: false });
+    });
+    return true;
+  }
+
+  if (message.action === 'STOP_SUBMISSION') {
+    submissionState.isStopped = true;
+    submissionState.isPaused = false;
+    persistAndBroadcastSubmissionState().then(() => {
+      sendResponse({ success: true, isStopped: true });
+    });
+    return true;
+  }
+
+  if (message.action === 'FAST_FORWARD_SUBMISSION') {
+    submissionState.skipRemainingDelay = true;
+    submissionState.isPaused = false;
+    persistAndBroadcastSubmissionState().then(() => {
+      sendResponse({ success: true, skipRemainingDelay: true });
+    });
+    return true;
+  }
+
+  if (message.action === 'GET_SUBMISSION_STATE') {
+    sendResponse({ state: submissionState });
+    return false;
+  }
 });
+
+// ========================================================
+// 5. BACKGROUND SUBMISSION RUNNER & NOTIFICATIONS
+// ========================================================
+
+let submissionState = {
+  status: 'idle', // 'idle' | 'running' | 'paused' | 'stopped' | 'completed' | 'error'
+  quizzes: [],
+  currentIndex: 0,
+  successCount: 0,
+  currentQuiz: null,
+  currentProgress: null,
+  isPaused: false,
+  isStopped: false,
+  skipRemainingDelay: false,
+  lazySettings: {
+    enabled: false,
+    delay: 15,
+    entropy: 5
+  },
+  batchName: '',
+  startedAt: null
+};
+
+let keepAliveTimer = null;
+
+function startKeepAlive() {
+  if (keepAliveTimer) return;
+  keepAliveTimer = setInterval(async () => {
+    try {
+      await chrome.storage.local.get('_sw_keepalive');
+    } catch (e) {}
+  }, 15000);
+}
+
+function stopKeepAlive() {
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+
+async function persistAndBroadcastSubmissionState() {
+  try {
+    await chrome.storage.local.set({ nst_submission_state: submissionState });
+    chrome.runtime.sendMessage({
+      action: 'SUBMISSION_STATE_UPDATE',
+      state: submissionState
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+/**
+ * Executes a pauseable, cancellable delay during background question countdown
+ */
+async function pauseableDelay({ targetDelayMs, delaySec, questionIndex, totalQuestions, onProgress }) {
+  let remainingMs = targetDelayMs;
+  const tickInterval = 100;
+
+  while (remainingMs > 0) {
+    if (submissionState.isStopped) {
+      throw new Error('SUBMISSION_STOPPED');
+    }
+
+    if (submissionState.skipRemainingDelay) {
+      break;
+    }
+
+    if (submissionState.isPaused) {
+      if (onProgress) {
+        onProgress({
+          stage: 'waiting',
+          isPaused: true,
+          current: questionIndex + 1,
+          total: totalQuestions,
+          delaySec,
+          remainingSec: remainingMs / 1000,
+          message: `Paused (${(remainingMs / 1000).toFixed(1)}s remaining)`
+        });
+      }
+      await new Promise(r => setTimeout(r, 200));
+      continue;
+    }
+
+    const waitStep = Math.min(tickInterval, remainingMs);
+    await new Promise(r => setTimeout(r, waitStep));
+    remainingMs -= waitStep;
+
+    if (onProgress) {
+      const remSec = Math.max(0, remainingMs / 1000);
+      onProgress({
+        stage: 'waiting',
+        isPaused: false,
+        current: questionIndex + 1,
+        total: totalQuestions,
+        delaySec,
+        remainingSec: remSec,
+        message: `Q ${questionIndex + 1}/${totalQuestions} • Waiting ${remSec.toFixed(1)}s before submit...`
+      });
+    }
+  }
+}
+
+/**
+ * Runs sequential quiz submission in background service worker even if popup is closed
+ */
+async function runBackgroundSubmission(token, quizzes, lazySettings, batchName = 'quizzes') {
+  if (submissionState.status === 'running') {
+    return { status: 'ALREADY_RUNNING' };
+  }
+
+  submissionState = {
+    status: 'running',
+    quizzes: (quizzes || []).map(q => ({ ...q })),
+    currentIndex: 0,
+    successCount: 0,
+    currentQuiz: null,
+    currentProgress: null,
+    isPaused: false,
+    isStopped: false,
+    skipRemainingDelay: false,
+    lazySettings: lazySettings || { enabled: false, delay: 15, entropy: 5 },
+    batchName,
+    startedAt: Date.now()
+  };
+
+  startKeepAlive();
+  await persistAndBroadcastSubmissionState();
+
+  try {
+    for (let i = 0; i < submissionState.quizzes.length; i++) {
+      if (submissionState.isStopped) {
+        break;
+      }
+
+      submissionState.currentIndex = i;
+      const q = submissionState.quizzes[i];
+      submissionState.currentQuiz = q;
+      await persistAndBroadcastSubmissionState();
+
+      const delayOptions = {
+        enabled: submissionState.lazySettings.enabled,
+        baseDelaySec: submissionState.lazySettings.delay,
+        entropySec: submissionState.lazySettings.entropy,
+        shouldSkipDelay: () => submissionState.skipRemainingDelay,
+        isStopped: () => submissionState.isStopped,
+        waitWithProgress: async ({ questionIndex, totalQuestions, targetDelayMs, delaySec, onTick }) => {
+          await pauseableDelay({
+            targetDelayMs,
+            delaySec,
+            questionIndex,
+            totalQuestions,
+            onProgress: (p) => {
+              submissionState.currentProgress = p;
+              persistAndBroadcastSubmissionState();
+            }
+          });
+        }
+      };
+
+      try {
+        const result = await submitQuizWithSupabaseSolutions({
+          token,
+          courseHash: q.courseHash,
+          assessmentHash: q.hash,
+          solutions: q.solutionData || null,
+          delayOptions,
+          onProgress: (p) => {
+            submissionState.currentProgress = p;
+            persistAndBroadcastSubmissionState();
+          }
+        });
+
+        q.isSubmitted = true;
+        submissionState.successCount++;
+
+        // Update cached mystery data in local storage
+        try {
+          const stored = await chrome.storage.local.get(['nst_mystery_data']);
+          if (stored && stored.nst_mystery_data) {
+            const mData = stored.nst_mystery_data;
+            const targetQ = (mData.quizzes || []).find(x => x.hash === q.hash);
+            if (targetQ) {
+              targetQ.isSubmitted = true;
+            }
+            if (mData.groupedBySubject) {
+              Object.keys(mData.groupedBySubject).forEach(sk => {
+                const grp = mData.groupedBySubject[sk];
+                if (grp) {
+                  grp.quizzes = (grp.quizzes || []).filter(x => x.hash !== q.hash);
+                  grp.lectures = (grp.lectures || []).filter(x => x.hash !== q.hash);
+                  grp.labs = (grp.labs || []).filter(x => x.hash !== q.hash);
+                }
+              });
+            }
+            mData.totalCount = (mData.quizzes || []).filter(x => !x.isSubmitted).length;
+            mData.solvableCount = (mData.quizzes || []).filter(x => !x.isSubmitted && x.hasAnswersInDb).length;
+            await chrome.storage.local.set({ nst_mystery_data: mData });
+          }
+        } catch (e) {}
+
+        // Requirement 4: Send native notification when a quiz is submitted (if lazy submit is ON)
+        if (submissionState.lazySettings?.enabled && typeof chrome !== 'undefined' && chrome.notifications) {
+          try {
+            chrome.notifications.create(`quiz-submitted-${q.hash}-${Date.now()}`, {
+              type: 'basic',
+              iconUrl: chrome.runtime.getURL('src/icons/icon128.png'),
+              title: 'Quiz Submitted!',
+              message: `"${q.title || 'Quiz'}" has been submitted successfully (${submissionState.successCount}/${submissionState.quizzes.length}).`,
+              priority: 1
+            });
+          } catch (notifErr) {
+            console.warn('[Newton Enhancer] Notification error:', notifErr);
+          }
+        }
+
+        // Notify popup of individual card completion
+        chrome.runtime.sendMessage({
+          action: 'QUIZ_SUBMITTED_SUCCESS',
+          quizHash: q.hash,
+          subjectLabel: q.subjectLabel,
+          isPractical: q.isPractical
+        }).catch(() => {});
+
+        await persistAndBroadcastSubmissionState();
+      } catch (err) {
+        if (err.message === 'SUBMISSION_STOPPED' || submissionState.isStopped) {
+          console.log('[Newton Enhancer] Submission stopped by user');
+          break;
+        }
+        console.error(`[Newton Enhancer] Failed to auto-submit quiz ${q.hash}:`, err);
+        chrome.runtime.sendMessage({
+          action: 'QUIZ_SUBMITTED_ERROR',
+          quizHash: q.hash,
+          error: err.message
+        }).catch(() => {});
+      }
+    }
+
+    if (submissionState.isStopped) {
+      submissionState.status = 'stopped';
+    } else {
+      submissionState.status = 'completed';
+      // Final completion notification if lazy submit was active
+      if (submissionState.lazySettings?.enabled && submissionState.successCount > 0 && typeof chrome !== 'undefined' && chrome.notifications) {
+        try {
+          chrome.notifications.create(`submission-done-${Date.now()}`, {
+            type: 'basic',
+            iconUrl: chrome.runtime.getURL('src/icons/icon128.png'),
+            title: 'All Quizzes Completed!',
+            message: `Successfully submitted ${submissionState.successCount} quizzes.`,
+            priority: 2
+          });
+        } catch (e) {}
+      }
+    }
+  } catch (batchErr) {
+    console.error('[Newton Enhancer] Background batch submission error:', batchErr);
+    submissionState.status = 'error';
+    submissionState.error = batchErr.message;
+  } finally {
+    stopKeepAlive();
+    await persistAndBroadcastSubmissionState();
+  }
+
+  return submissionState;
+}

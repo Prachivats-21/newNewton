@@ -16,3 +16,4 @@ skills-lock.json
 .firebase/
 *.json.key
 *-service-account*.json
+auth-token

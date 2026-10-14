@@ -9,7 +9,8 @@
     "tabs",
     "scripting",
     "declarativeNetRequest",
-    "cookies"
+    "cookies",
+    "notifications"
   ],
   "host_permissions": [
     "https://my.newtonschool.co/*",

@@ -184,23 +184,33 @@ Deno.serve(async (req: Request) => {
           method: "GET",
           headers: {
             "Accept": "application/json",
-            "Authorization": `Bearer ${token}`
+            "Authorization": `Bearer ${token}`,
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
           }
         });
         if (appliedResp.ok) {
-          const courses = await appliedResp.json();
-          if (Array.isArray(courses) && courses[0]) {
-            const adminCourses = courses[0]?.children_courses?.admin_unit_courses || [];
-            const active = adminCourses.find((c: any) => c.is_active_admin_unit_course) || adminCourses[0] || courses[0];
-            activeCourse = active.hash || courses[0].hash;
+          const coursesData = await appliedResp.json();
+          const programs = Array.isArray(coursesData) ? coursesData : (coursesData.results || [coursesData]);
+          for (const prog of programs) {
+            if (!prog) continue;
+            const adminCourses = prog.children_courses?.admin_unit_courses || prog.admin_unit_courses || [];
+            const active = adminCourses.find((c: any) => c.is_active_admin_unit_course) || adminCourses[0];
+            if (active && active.hash && active.hash !== "h") {
+              activeCourse = active.hash;
+              break;
+            }
+            if (prog.hash && prog.hash !== "h") {
+              activeCourse = prog.hash;
+              break;
+            }
           }
         }
       }
 
       if (!activeCourse) {
         return new Response(
-          JSON.stringify({ error: "Could not resolve active semester course hash" }),
-          { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+          JSON.stringify({ status: "PENDING_COURSE", message: "No active semester course hash identified yet" }),
+          { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
         );
       }
 
