@@ -24,6 +24,7 @@ Newton School's frontend contains:
 /Users/swap/Developer/newton-enhancer/
 ├── README.md                      # Project README & user guide
 ├── menu.json                      # Reference campus mess menu
+├── updates.xml                    # Chrome auto-update manifest (Google Update Protocol 2.0)
 ├── supabase/                      # Supabase schema & setup guide (AWS Mumbai ap-south-1)
 │   ├── schema.sql                 # PostgreSQL tables & RLS policies
 │   └── README.md                  # Supabase quickstart guide
@@ -147,3 +148,18 @@ Blocking tracking on a Next.js / React single-page application requires dual-lay
    - Toggle **Telemetry & Tracking** ON to block tracking and diagnostic uploads, or OFF to allow.
    - Check the **Mess Menu** tab with Garvit-png's maintained menu data.
    - Check the **Attendance** tab with live sync, skip calculators, and rollup metrics.
+
+---
+
+## 7. Automatic Chrome Updates
+
+`newNewton` supports native Chrome auto-updates via the Google Update Protocol (v2.0):
+
+1. **Packaged CRX Installation**:
+   - Download `newNewton.crx` from the [Latest Release](https://github.com/suwupnil/newNewton/releases/latest).
+   - In `chrome://extensions/` with **Developer mode** enabled, drag and drop `newNewton.crx`.
+2. **Auto-Update Mechanism**:
+   - The extension manifest specifies `update_url`:
+     `https://raw.githubusercontent.com/suwupnil/newNewton/main/updates.xml`
+   - Every few hours (or immediately upon clicking **Update** in `chrome://extensions/`), Chrome inspects `updates.xml`.
+   - If a new version exists, Chrome automatically downloads and installs the updated `.crx` seamlessly without losing local storage or preferences.

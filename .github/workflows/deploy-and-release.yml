@@ -43,11 +43,30 @@ jobs:
           if [ -n "${{ secrets.CRX_PRIVATE_KEY }}" ]; then
             echo "${{ secrets.CRX_PRIVATE_KEY }}" > /tmp/key.pem
             npx --yes crx3 -p /tmp/key.pem -o dist/newNewton-v${{ steps.ext_version.outputs.version }}.crx extension
+            cp dist/newNewton-v${{ steps.ext_version.outputs.version }}.crx dist/newNewton.crx
             rm -f /tmp/key.pem
             echo "Successfully generated signed CRX."
           else
             echo "Notice: CRX_PRIVATE_KEY secret is not set. Skipping .crx generation."
           fi
+
+      - name: Generate Auto-Update Manifest (updates.xml)
+        env:
+          VERSION: ${{ steps.ext_version.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = process.env.VERSION;
+            const xml = \`<?xml version='1.0' encoding='UTF-8'?>
+            <gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>
+              <app appid='colbeijnblfedgifoekbhiflkohipnkp'>
+                <updatecheck codebase='https://github.com/suwupnil/newNewton/releases/latest/download/newNewton.crx' version='\${v}' />
+              </app>
+            </gupdate>
+            \`.trim() + '\n';
+            fs.writeFileSync('updates.xml', xml);
+            fs.writeFileSync('dist/updates.xml', xml);
+          "
 
       - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
@@ -60,15 +79,30 @@ jobs:
 
             #### 📦 Downloads:
             - **`newNewton-v${{ steps.ext_version.outputs.version }}.crx`**: Pre-packaged Chrome extension.
+            - **`newNewton.crx`**: Latest direct package link for auto-updates.
             - **`newNewton-v${{ steps.ext_version.outputs.version }}.zip`**: Unpacked extension directory for Developer Mode loading.
+            - **`updates.xml`**: Chrome Autoupdate Manifest.
 
-            #### 🛠️ Installation:
-            1. Download the `.crx` or extract the `.zip`.
+            #### 🛠️ Installation & Auto-Updates:
+            1. Download `newNewton.crx` or extract `newNewton-v${{ steps.ext_version.outputs.version }}.zip`.
             2. In Chrome, open `chrome://extensions/`.
             3. Enable **Developer mode** in the top-right corner.
-            4. Drag & drop the `.crx` file onto the page, OR click **Load unpacked** and select the unzipped directory.
+            4. Drag & drop the `.crx` file onto the page.
+            5. Future updates will be checked and installed automatically via `updates.xml`!
           files: |
             dist/newNewton-v${{ steps.ext_version.outputs.version }}.zip
             dist/newNewton-v*.crx
+            dist/newNewton.crx
+            dist/updates.xml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync updates.xml to main branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add updates.xml
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: sync updates.xml to v${{ steps.ext_version.outputs.version }} [skip ci]"
+            git push origin main
+          fi
