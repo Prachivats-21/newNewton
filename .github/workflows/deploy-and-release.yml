@@ -24,6 +24,11 @@ jobs:
         with:
           node-version: 22
 
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Extract Manifest Version
         id: ext_version
         run: |
@@ -31,21 +36,23 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "Detected version: v${VERSION}"
 
+      - name: Minify Code & Validate TypeScript / JavaScript
+        run: node scripts/build.js
+
       - name: Create ZIP Package
         run: |
-          mkdir -p dist
-          cd extension
-          zip -r ../dist/newNewton-v${{ steps.ext_version.outputs.version }}.zip . -x ".*" -x "__MACOSX"
-          cd ..
+          cd dist/extension
+          zip -r ../newNewton-v${{ steps.ext_version.outputs.version }}.zip . -x ".*" -x "__MACOSX"
+          cd ../..
 
       - name: Build Signed CRX File
         run: |
           if [ -n "${{ secrets.CRX_PRIVATE_KEY }}" ]; then
             echo "${{ secrets.CRX_PRIVATE_KEY }}" > /tmp/key.pem
-            npx --yes crx3 -p /tmp/key.pem -o dist/newNewton-v${{ steps.ext_version.outputs.version }}.crx extension
+            npx --yes crx3 -p /tmp/key.pem -o dist/newNewton-v${{ steps.ext_version.outputs.version }}.crx dist/extension
             cp dist/newNewton-v${{ steps.ext_version.outputs.version }}.crx dist/newNewton.crx
             rm -f /tmp/key.pem
-            echo "Successfully generated signed CRX."
+            echo "Successfully generated signed CRX from minified build."
           else
             echo "Notice: CRX_PRIVATE_KEY secret is not set. Skipping .crx generation."
           fi

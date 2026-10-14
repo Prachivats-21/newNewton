@@ -17,3 +17,5 @@ skills-lock.json
 *.json.key
 *-service-account*.json
 auth-token
+dist/
+deno.lock
