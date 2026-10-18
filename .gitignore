@@ -19,3 +19,5 @@ skills-lock.json
 auth-token
 dist/
 deno.lock
+.gemini/
+macos/build/
